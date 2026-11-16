@@ -124,5 +124,8 @@ JVmeteo 1.3.2, boot=deepsleep ...                (bez NEPOTVRZENO = potvrzeno)
 
 - rollback na desce; negativní testy na desce (zlý podpis, převrácený bit, jiná verze) – ověřeno jen na hostu a v podepisovači;
 - ruční trigger TalkBack proti skutečnému ThingSpeaku (fake server ho zatím neumí);
-- NTP a pozastavení v bodě 5 mají host test jen pro rozhodovací logiku (BLOCK 03); chování na desce se ověřuje při OTA 1.3.1 → 1.3.2;
+- **NTP:** host test hlídá jen rozhodování (BLOCK 03, T23). Na desce **1.3.2 selhalo**: `NTP: bez odpovedi do 4000 ms` při každém odeslání
+  (zbytečné 4 s radia), přestože se čas nastavil (`Cas: … (RTC)` po restartu byl správný) – příčina: `sntp_get_sync_status()` nikdy nedosáhlo
+  `COMPLETED`. 1.3.3 ověřuje úspěch notifikací jádra (`sntp_set_time_sync_notification_cb`); **na desce zatím neověřeno** (hledat `NTP: synchronizovano za … ms`);
+- pozastavení při OTA: na desce ověřeno jen logem `cinnost pozastavena` před stažením (1.3.2); `cinnost obnovena` se vypíše jen při neúspěšné/aktuální kontrole;
 - spotřeba OTA kontroly a NTP na baterii; GitHub Enterprise Server se nepodporuje (adresa je pevně `github.com`).

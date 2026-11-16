@@ -74,7 +74,7 @@
 
 // Semver MAJOR.MINOR.PATCH (pripona za '-' se pri porovnani ignoruje). MUSI se
 // shodovat s tagem vydani vMAJOR.MINOR.PATCH - workflow to kontroluje.
-#define FW_VERSION "1.3.2"
+#define FW_VERSION "1.3.3"
 
 // Casove konstanty v milisekundach (puvodni hodnoty zachovany)
 #define INTERVAL_SPANKU_MS 90000       // perioda mereni (90 s, mereno od probuzeni k probuzeni)
@@ -1255,17 +1255,23 @@ static void cas_zaloguj(const char *zdroj) {
   LOGI("Cas: %s (%s)", b, zdroj);
 }
 
+// Uspech NTP se pozna z notifikace jadra (cas byl skutecne nastaven), ne z sntp_get_sync_status():
+// to u 1.3.2 nikdy nedosahlo COMPLETED, i kdyz se cas nastavil, takze se NTP opakovalo pri kazdem
+// odeslani (zbytecne 4 s radia na baterii). Zmereno na HW 2026-11-16.
+static volatile bool s_ntpNastaveno = false;
+static void cas_notifikace(struct timeval *) { s_ntpNastaveno = true; }
+
 static void cas_krok() {
   if (!jvCasPotrebaSync((int64_t)time(nullptr), rtcCasPosledniSync, CAS_SYNC_INTERVAL_S)) { return; }
   if (WiFi.status() != WL_CONNECTED) { return; }
-  sntp_set_sync_status(SNTP_SYNC_STATUS_RESET);
+  s_ntpNastaveno = false;
+  sntp_set_time_sync_notification_cb(cas_notifikace);
   configTzTime(CAS_TZ, "pool.ntp.org", "time.nist.gov");
   const uint32_t start = millis();
-  while (sntp_get_sync_status() != SNTP_SYNC_STATUS_COMPLETED && millis() - start < CAS_SYNC_TIMEOUT_MS) {
-    vTaskDelay(pdMS_TO_TICKS(50));
-  }
-  if (sntp_get_sync_status() == SNTP_SYNC_STATUS_COMPLETED) {
+  while (!s_ntpNastaveno && millis() - start < CAS_SYNC_TIMEOUT_MS) { vTaskDelay(pdMS_TO_TICKS(50)); }
+  if (s_ntpNastaveno) {
     rtcCasPosledniSync = (int64_t)time(nullptr);
+    LOGI("NTP: synchronizovano za %lu ms", (unsigned long)(millis() - start));
     cas_zaloguj("NTP");
   } else {
     LOGE("NTP: bez odpovedi do %lu ms, zkusi se pri dalsim odeslani", (unsigned long)CAS_SYNC_TIMEOUT_MS);
