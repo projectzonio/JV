@@ -1205,9 +1205,10 @@ static void ota_rollback() {}
 #include "jv_ota_local.h"   // jen pro lokalni testy (v .gitignore): JV_OTA_URL_ZAKLAD, JV_TB_HOST, JV_TB_PORT
 #endif
 #include "jv_ota_pubkey.h"
+#include "jv_ota_config.h"  // JV_OTA_REPO "<majitel>/<repozitar>"; CI ho prepise podle github.repository
 
 #ifndef JV_OTA_URL_ZAKLAD
-#define JV_OTA_URL_ZAKLAD "https://github.com/projectzonio/JV/releases/latest/download/"
+#define JV_OTA_URL_ZAKLAD "https://github.com/" JV_OTA_REPO "/releases/latest/download/"
 #endif
 #ifndef JV_TB_HOST
 #define JV_TB_HOST "api.thingspeak.com"

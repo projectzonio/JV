@@ -4,6 +4,8 @@
   sign_ota.py sign   --in app.bin --key private.pem --type jvmeteo-esp32c3 --version 1.3.1 --out firmware.bin
   sign_ota.py verify --in firmware.bin --pub public.pem --type jvmeteo-esp32c3 --version 1.3.1
   sign_ota.py verify --in firmware.bin --pub-header jv_ota_pubkey.h --type ... --version ...
+  sign_ota.py keygen --out-key private.pem --pub-header jv_ota_pubkey.h   (vlastni dvojice klicu)
+  sign_ota.py keycheck --key private.pem --pub-header jv_ota_pubkey.h     (sedi secret k firmware?)
 
 Format (shodny se zrt_ota.cpp, jen jina domena, aby se nedal podstrcit obraz
 podepsany jinym klicem/produktem):
@@ -124,9 +126,84 @@ def verify(a):
     return 0
 
 
+HEADER_TEMPLATE = """#pragma once
+// Verejny klic pro overeni podpisu OTA obrazu (RSA-2048, PKCS#1 v1.5, SHA-256).
+// Privatni klic NENI v repu: drzi ho majitel vydavatelskeho workflow a je v GitHub
+// Actions secretu OTA_SIGNING_KEY. Vymena klice = novy USB flash vsech zarizeni,
+// protoze stara zarizeni zadny jiny klic neprijmou.
+//
+// Format a tok: tools/ota/sign_ota.py, .github/workflows/firmware.yml.
+#define JV_OTA_PUBKEY_PEM \\
+{radky}
+"""
+
+
+def pem_body(pem_text):
+    return "".join(pem_text.split())
+
+
+def keygen(a):
+    """Vlastni dvojice klicu pro vlastni GitHub ucet: privatni PEM mimo repo, verejny do hlavicky firmware."""
+    ossl = openssl_bin()
+    if os.path.exists(a.out_key) and not a.force:
+        print("INVALID RUN: %s uz existuje (prepsani by znehodnotilo zarizeni, ktera ho znaji; --force)" % a.out_key)
+        return 2
+    r = subprocess.run([ossl, "genrsa", "-out", a.out_key, "2048"], capture_output=True)
+    if r.returncode != 0 or not os.path.exists(a.out_key):
+        print("INVALID RUN: openssl genrsa selhal:", r.stderr.decode(errors="replace").strip())
+        return 2
+    try:
+        os.chmod(a.out_key, 0o600)
+    except OSError:
+        pass
+    r = subprocess.run([ossl, "rsa", "-in", a.out_key, "-pubout"], capture_output=True)
+    pub = r.stdout.decode("ascii", errors="replace").strip().splitlines()
+    if r.returncode != 0 or len(pub) < 3 or not pub[0].startswith("-----BEGIN PUBLIC KEY-----"):
+        print("INVALID RUN: nepodarilo se odvodit verejny klic:", r.stderr.decode(errors="replace").strip())
+        return 2
+    radky = "\n".join('  "%s\\n" %s' % (l, "\\" if i < len(pub) - 1 else "") for i, l in enumerate(pub)).rstrip()
+    with open(a.pub_header, "w", encoding="ascii", newline="\n") as f:
+        f.write(HEADER_TEMPLATE.format(radky=radky))
+    print("Privatni klic: %s  (NIKDY do repa, do chatu ani do logu; zalohujte - bez nej nejde vydat dalsi verzi)" % a.out_key)
+    print("Verejny klic zapsan do %s -> commitnete ho." % a.pub_header)
+    print("Dalsi krok: ulozte obsah privatniho klice jako GitHub secret OTA_SIGNING_KEY"
+          " (Settings -> Secrets and variables -> Actions, nebo environment 'release')."
+          " Zarizeni se zabudovanym klicem z JINEHO uctu tuhle zmenu neprijmou - nahrajte je pres USB.")
+    return 0
+
+
+def keycheck(a):
+    """Sedi tajny klic z CI s verejnym klicem ve firmware? Srozumitelna chyba misto zahadneho FAIL pri overeni."""
+    ossl = openssl_bin()
+    with tempfile.TemporaryDirectory() as td:
+        pub = os.path.join(td, "pub.pem")
+        pubkey_from_header(a.pub_header, pub)
+        firmware_pem = open(pub, encoding="ascii").read()
+    r = subprocess.run([ossl, "rsa", "-in", a.key, "-pubout"], capture_output=True)
+    if r.returncode != 0:
+        print("FAIL: secret OTA_SIGNING_KEY neni platny soukromy RSA klic (PEM) - vlozte cely obsah souboru vcetne radku BEGIN/END")
+        return 1
+    if pem_body(r.stdout.decode("ascii", errors="replace")) != pem_body(firmware_pem):
+        print("FAIL: secret OTA_SIGNING_KEY nepatri k verejnemu klici ve firmware (%s). "
+              "Bud vlozte spravny privatni klic, nebo si vyrobte vlastni dvojici: "
+              "python tools/ota/sign_ota.py keygen --out-key <soubor.pem> --pub-header %s, "
+              "commitnete hlavicku a ulozte novy secret. Zarizeni se starym klicem se pak aktualizuji jen pres USB."
+              % (a.pub_header, a.pub_header))
+        return 1
+    print("OK: secret odpovida verejnemu klici ve firmware")
+    return 0
+
+
 def main():
     p = argparse.ArgumentParser()
     sub = p.add_subparsers(dest="cmd", required=True)
+    g = sub.add_parser("keygen")
+    g.add_argument("--out-key", required=True, help="kam zapsat soukromy klic (mimo repozitar)")
+    g.add_argument("--pub-header", required=True, help="jv_ota_pubkey.h, ktery se prepise")
+    g.add_argument("--force", action="store_true")
+    c = sub.add_parser("keycheck")
+    c.add_argument("--key", required=True)
+    c.add_argument("--pub-header", required=True)
     s = sub.add_parser("sign")
     s.add_argument("--in", dest="infile", required=True)
     s.add_argument("--key", required=True)
@@ -140,7 +217,7 @@ def main():
     v.add_argument("--type", required=True)
     v.add_argument("--version", required=True)
     a = p.parse_args()
-    return sign(a) if a.cmd == "sign" else verify(a)
+    return {"sign": sign, "verify": verify, "keygen": keygen, "keycheck": keycheck}[a.cmd](a)
 
 
 if __name__ == "__main__":

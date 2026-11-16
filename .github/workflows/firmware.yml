@@ -5,6 +5,12 @@ name: firmware
 # release (jen tag vX.Y.Z) -> podpis klicem z environmentu "release", overeni proti
 #   klici zabudovanemu ve firmware, publikace GitHub Release.
 #
+# Nezavisle na uctu: zdroj aktualizaci se do firmware vlozi z ${{ github.repository }},
+# takze fork / kopie / preneseny repozitar vydava a podepisuje vlastni verze. Fork si musi
+# vyrobit vlastni klic (sign_ota.py keygen), commitnout jv_ota_pubkey.h a ulozit secret
+# OTA_SIGNING_KEY; GitHub na forku workflow nejdriv vypina (zalozka Actions -> povolit).
+# Repozitar musi byt verejny - zarizeni stahuje bez prihlaseni.
+#
 # Zarizeni stahuji z .../releases/latest/download/, coz je nejnovejsi NE-prerelease.
 # Tag s priponou (v1.4.0-rc1) vznikne jako prerelease a zarizeni ho nevidi.
 
@@ -74,6 +80,18 @@ jobs:
             "Adafruit BusIO@1.17.4" \
             "DHT sensor library@1.4.7"
 
+      - name: Zdroj aktualizaci = tento repozitar (funguje pod jakymkoli GitHub uctem)
+        env:
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          if ! printf '%s' "${REPO}" | grep -Eq '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$'; then
+            echo "::error::neocekavany tvar github.repository: ${REPO}"
+            exit 1
+          fi
+          printf '#pragma once\n#define JV_OTA_REPO "%s"\n' "${REPO}" > "${SKETCH}/jv_ota_config.h"
+          cat "${SKETCH}/jv_ota_config.h"
+
       - name: Preklad
         run: |
           arduino-cli compile --fqbn "${FQBN}" --warnings default \
@@ -122,7 +140,7 @@ jobs:
         run: |
           set -euo pipefail
           if [ -z "${OTA_SIGNING_KEY}" ]; then
-            echo "::error::Chybi secret OTA_SIGNING_KEY v environmentu 'release'"
+            echo "::error::Chybi secret OTA_SIGNING_KEY (repozitarni, nebo v environmentu 'release'). Vlastni klic vyrobi: python jvmeteook2/tools/ota/sign_ota.py keygen --out-key private.pem --pub-header jvmeteook2/jv_ota_pubkey.h"
             exit 1
           fi
           VER="${GITHUB_REF_NAME#v}"
@@ -132,6 +150,8 @@ jobs:
           printf '%s\n' "${OTA_SIGNING_KEY}" > "${KEY}"
 
           SIGN="${SKETCH}/tools/ota/sign_ota.py"
+          # Srozumitelna chyba, kdyz secret nepatri ke klici ve firmware (typicky fork bez vlastni dvojice klicu).
+          python3 "${SIGN}" keycheck --key "${KEY}" --pub-header "${SKETCH}/jv_ota_pubkey.h"
           python3 "${SIGN}" sign --in dist/app.bin --key "${KEY}" \
             --type "${OTA_TYPE}" --version "${VER}" --out "dist/${OTA_TYPE}.bin"
           # Overeni proti klici, ktery je ve FIRMWARE (ne proti klici, ktery tu chceme mit):

@@ -71,10 +71,28 @@ Zařízení si samo stáhne novou verzi z GitHub Releases a před instalací ov�
 1. Zvýšit `FW_VERSION` v `jvmeteook2.ino` (semver, např. `1.3.1`).
 2. `git tag v1.3.1 && git push origin v1.3.1`. Workflow `.github/workflows/firmware.yml`
    spustí host test, přeloží, **podepíše** a publikuje release. Tag musí odpovídat `FW_VERSION`.
-3. Soukromý klíč je jen v GitHub environmentu `release` jako secret `OTA_SIGNING_KEY`
-   (nikdy v repu). Workflow podpis ověří proti klíči zabudovanému ve firmware; nesedí-li, release nevznikne.
-   Vhodné: v environmentu `release` zapnout schvalování, ať tag sám klíč nepoužije.
+3. Soukromý klíč je jen v GitHubu jako secret `OTA_SIGNING_KEY` (nikdy v repu): buď v environmentu
+   `release` (doporučeno, jde zapnout schvalování, ať tag sám klíč nepoužije), nebo jako repozitářový secret.
+   Workflow podpis ověří proti klíči zabudovanému ve firmware; nesedí-li, release nevznikne a log řekne proč.
 4. Výměna klíče = nový USB flash všech zařízení (stará zařízení jiný klíč nepřijmou).
+
+### Vlastní GitHub účet (fork, kopie, převedený repozitář)
+
+JVmeteo OTA nezávisí na tom, kdo firmware staví. Zdroj aktualizací je `JV_OTA_REPO` v `jv_ota_config.h`
+a workflow ho před překladem přepíše na `github.repository`, takže build pod jakýmkoli účtem stahuje
+jen z releasů toho účtu. Co musí udělat majitel nového repozitáře (jednou):
+
+1. Repozitář musí být **veřejný** (zařízení stahuje bez přihlášení). Na forku povolit *Actions*.
+2. `python jvmeteook2/tools/ota/sign_ota.py keygen --out-key private.pem --pub-header jvmeteook2/jv_ota_pubkey.h`
+   vyrobí vlastní dvojici klíčů (RSA-2048). Veřejný klíč commitnout, `private.pem` uložit mimo repozitář a zálohovat.
+3. Obsah `private.pem` vložit jako secret `OTA_SIGNING_KEY` (*Settings → Secrets and variables → Actions*,
+   nebo environment `release`). `gh secret set OTA_SIGNING_KEY < private.pem` dělá totéž.
+4. Zařízení se zabudovaným cizím klíčem vlastní releasy nepřijmou (a naopak) — první firmware z nového účtu se
+   nahraje přes USB (`jvmeteo-esp32c3-usb-full-<verze>.bin`).
+
+Chybí-li bod 2–3, workflow release nevydá a v logu uvede příkaz, který chybí. Lokální překlad (Arduino IDE)
+bere repozitář z `jv_ota_config.h` — při vlastním forku tam přepište `JV_OTA_REPO`.
+GitHub Enterprise Server se nepodporuje (adresa je pevně `https://github.com/`).
 
 Lokální test proti vlastnímu serveru: soubor `jv_ota_local.h` vedle sketche (v `.gitignore`)
 a v něm `#define JV_OTA_URL_ZAKLAD "https://<ip>:<port>/"`, `JV_TB_HOST`, `JV_TB_PORT`.
