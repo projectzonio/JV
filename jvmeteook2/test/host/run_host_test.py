@@ -4,20 +4,30 @@
 
 1. Vyrizne BLOCK 03 podle border marks (//-----------3-----------), bez kopie.
 2. Prelozi test_power_logic.cpp a spusti ho -> ocekava PASS.
-3. Mutace: vrati opravu chyby v5 (baseline po uspesnem odeslani) a ocekava FAIL.
-   Kdyz mutovany radek ve bloku neni, je to INVALID RUN, ne PASS.
+3. Mutace: vrati opravu chyby v5 (baseline po uspesnem odeslani), vypne ulozeni
+   RTC po bootu a rozbije kazdou z OTA pojistek; test musi u kazde spadnout.
+   Kdyz mutovany radek ve bloku neni prave jednou, je to INVALID RUN, ne PASS.
+4. Krizova kontrola: prefix podpisu, ktery pocita zarizeni (BLOCK 03), se musi
+   bajt po bajtu shodovat s tim, co podepisuje tools/ota/sign_ota.py. Bez toho by
+   zarizeni a podepisovac mohly tise rozejit a kazdy obraz by byl "neplatny".
 
-Exit: 0 = PASS a mutace odhalena, 1 = FAIL, 2 = INVALID RUN.
+Prekladac: MSVC (vcvars64), jinak g++/c++ (CI na Linuxu).
+
+Exit: 0 = PASS a vsechny mutace odhaleny, 1 = FAIL, 2 = INVALID RUN.
 """
+import importlib.util
 import os
 import re
+import shutil
 import subprocess
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SKETCH = os.path.normpath(os.path.join(HERE, "..", "..", "jvmeteook2.ino"))
+SIGNER = os.path.normpath(os.path.join(HERE, "..", "..", "tools", "ota", "sign_ota.py"))
 BUILD = os.path.join(HERE, "build")
 VCVARS = r"C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat"
+USE_MSVC = os.path.exists(VCVARS)
 FIX_LINE = "for (int i = 0; i < JV_POLI; i++) s.odeslano[i] = cur[i];"
 MASK_LINE = "s.odeslanoMaska = jvMaskaPlatnych(cur);"
 COMMIT_LINE = "jvSlotyUloz(sloty, s); // commit-at-boot"
@@ -49,14 +59,21 @@ def build_and_run(block_src, tag):
         f.write(block_src)
     exe = os.path.join(BUILD, "test_%s.exe" % tag)
     src = os.path.join(HERE, "test_power_logic.cpp")
-    bat = os.path.join(BUILD, "build_%s.bat" % tag)
-    with open(bat, "w", encoding="ascii", newline="") as f:
-        f.write('@call "' + VCVARS + '" >nul' + CRLF)
-        f.write('@cl /nologo /EHsc /W3 /utf-8 /I "' + BUILD + '" "' + src + '" /Fe:"' + exe
-                + '" /Fo"' + os.path.join(BUILD, "test_%s.obj" % tag) + '"' + CRLF)
     if os.path.exists(exe):
         os.remove(exe)
-    r = subprocess.run(["cmd", "/c", bat], capture_output=True, text=True)
+    if USE_MSVC:
+        bat = os.path.join(BUILD, "build_%s.bat" % tag)
+        with open(bat, "w", encoding="ascii", newline="") as f:
+            f.write('@call "' + VCVARS + '" >nul' + CRLF)
+            f.write('@cl /nologo /EHsc /W3 /utf-8 /I "' + BUILD + '" "' + src + '" /Fe:"' + exe
+                    + '" /Fo"' + os.path.join(BUILD, "test_%s.obj" % tag) + '"' + CRLF)
+        r = subprocess.run(["cmd", "/c", bat], capture_output=True, text=True)
+    else:
+        cxx = shutil.which("g++") or shutil.which("c++") or shutil.which("clang++")
+        if not cxx:
+            invalid("neni MSVC ani g++/c++/clang++")
+        r = subprocess.run([cxx, "-std=c++17", "-O0", "-Wall", "-I", BUILD, src, "-o", exe, "-lm"],
+                           capture_output=True, text=True)
     if r.returncode != 0 or not os.path.exists(exe):
         print(r.stdout[-3000:], r.stderr[-2000:])
         invalid("preklad (%s) selhal" % tag)
@@ -76,6 +93,19 @@ def main():
     if rc != 0:
         return 1
 
+    # Krizova kontrola prefixu podpisu: zarizeni vs. sign_ota.py.
+    m = re.search(r"^PREFIX (\S+) (\S+) ([0-9a-f]+)$", out, re.M)
+    if not m:
+        invalid("test nevypsal radek PREFIX - krizova kontrola signeru nema co porovnat")
+    spec = importlib.util.spec_from_file_location("sign_ota", SIGNER)
+    signer = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(signer)
+    ocekavany = signer.prefix(m.group(1), m.group(2)).hex()
+    if m.group(3) != ocekavany:
+        print("FAIL: prefix zarizeni != prefix signeru\n  zarizeni: %s\n  signer:   %s" % (m.group(3), ocekavany))
+        return 1
+    print("OK: prefix podpisu zarizeni se shoduje se sign_ota.py (%d B)" % (len(ocekavany) // 2))
+
     mutace = [
         # Chovani v5: baseline se nastavi jen pri prvnim odeslani, dal uz ne.
         ("v5_baseline", [(FIX_LINE, "/* MUTACE: oprava v5 vracena */"),
@@ -83,6 +113,20 @@ def main():
                                      " memcpy(s.odeslano, cur, sizeof(s.odeslano)); }")]),
         # Ulozeni RTC az pri uspani: pad uprostred cyklu se nezapocita.
         ("commit_at_boot", [(COMMIT_LINE, "/* MUTACE: ulozeni po bootu vypnuto */")]),
+        # OTA: stejna verze se tvari jako novejsi -> zarizeni by se aktualizovalo porad dokola.
+        ("ota_stejna_verze", [("return false;  // stejna verze neni novejsi (jinak by se aktualizovalo porad dokola)",
+                               "return true;  /* MUTACE */")]),
+        # OTA: obraz s nizsi verzi se povazuje za novejsi -> downgrade.
+        ("ota_downgrade", [("if (a[i] != b[i]) return a[i] > b[i];", "if (a[i] != b[i]) return a[i] < b[i];")]),
+        # OTA: po instalaci se obraz neoznaci jako nepotvrzeny -> rollback nikdy nesepne.
+        ("ota_bez_nepotvrzeno", [('s.otaNepotvrzeno = 1;  // novy obraz bezi "na zkousku"', "/* MUTACE */")]),
+        # OTA: obraz se nikdy nepotvrdi -> kazdy by se casem "vratil".
+        ("ota_bez_potvrzeni", [("if (s.otaCyklyPoInstalaci >= t.otaPotvrzeniCyklu) {", "if (false) {")]),
+        # OTA: pokus se nezapocita pred spustenim -> zaseknuty pokus nema backoff.
+        ("ota_bez_pesimisticke_stopy", [("s.otaChybStreak = jvSatInc(s.otaChybStreak);", "/* MUTACE */")]),
+        # OTA: kontrola i pri brownoutu/padech -> TLS spicka na slabe baterii.
+        ("ota_bez_pojistek", [("if (boot == JV_BOOT_BROWNOUT || s.brownoutStreak > 0 || s.padStreak > 0) return false;",
+                               "/* MUTACE */")]),
     ]
     for jmeno, nahrady in mutace:
         mutant = block

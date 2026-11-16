@@ -1,14 +1,16 @@
 //-----------1-----------
 // BLOCK 01: HEADER, INCLUDES, BUILD-TIME TUNING
 //
-// JVmeteo COREON - firmware 1.2-lp (low-power + recovery)
+// JVmeteo COREON - firmware 1.3.0 (low-power + recovery + OTA)
 // Zaklad: jvmeteook2 (ESP32, ThingSpeak, konfiguracni AP po kratkem resetu).
 // Low-power a recovery principy prevzaty z Zonio legacy
 // v5_deepsleep_BME280 (ESP8266) a prepsany pro ESP32 rodinu (C3/S3/klasik).
+// OTA klient (BLOCK 08) je ESP32 vetev zonio_runtime/zrt_ota.cpp upravena pro
+// JVmeteo: zdroj GitHub Releases, vlastni klic podpisu, trigger pres ThingSpeak.
 //
 // Zachovano beze zmeny: ThingSpeak komunikace (pole 1-7), konfiguracni AP
 // JVmeteo_SETUP + web formular, NVS klice "meteo", vychozi piny a senzory.
-// Zamerne NENI: OTA, MQTT, XOR.
+// Zamerne NENI: MQTT, XOR.
 //
 // ============================ INDEX BLOKU ================================
 // Blok | Obsah                                             | Zavisi na
@@ -16,18 +18,24 @@
 //  01  | include, verze, ladici konstanty, LOG makra       | -
 //  02  | uzivatelska konfigurace, piny, globalni hodnoty   | 01
 //  03  | POWER LOGIC CORE: rozhodnuti o odeslani, backoff, | nic (cisty C++,
-//      | delka spanku, RTC sloty + CRC, zhaveni MQ         | host test/twin)
+//      | delka spanku, RTC sloty + CRC, zhaveni MQ,        | host test/twin)
+//      | OTA: verze, prefix podpisu, plan kontrol, rollback|
 //  04  | RTC sloty v RTC_NOINIT, klasifikace bootu,        | 03
 //      | awake watchdog (esp_timer)                        |
 //  05  | senzory BME280/BMP280/MPU6050/DHT22, obnova I2C,  | 02, 03, 04
 //      | neblokujici vzorkovani MQ-9                       |
 //  06  | Wi-Fi (neblokujici, BSSID cache, TX) + ThingSpeak | 02, 03, 04
 //  07  | konfiguracni portal, NVS "meteo", okno 1,2 s      | 02, 04
-//  08  | uspani (radio off, ulozeni RTC, deep sleep)       | 04
-//  09  | stavovy automat mericiho cyklu, setup(), loop()   | vse
+//  08  | OTA: GitHub Releases, podpis, rollback, trigger   | 02, 03, 04
+//      | pres ThingSpeak TalkBack                          |
+//  09  | uspani (radio off, ulozeni RTC, deep sleep)       | 04
+//  10  | stavovy automat mericiho cyklu, setup(), loop()   | vse
 //
-// Tok mericiho cyklu (BLOCK 09, kazdy krok z loop(), zadne delay()):
-//   F_SENZORY -> F_CEKEJ_MQ -> F_PLAN -> [F_WIFI -> F_ODESLI] -> F_KONEC -> F_SPANEK
+// Tok mericiho cyklu (BLOCK 10, kazdy krok z loop(), zadne delay()):
+//   F_SENZORY -> F_CEKEJ_MQ -> F_PLAN -> [F_WIFI -> F_ODESLI -> F_OTA] -> F_KONEC -> F_SPANEK
+// F_OTA bezi jen po USPESNEM odeslani (Wi-Fi uz je zapnuta) a jen kdyz je kontrola
+// splatna nebo prisel trigger; uvnitr blokuje (TLS + stazeni), horni mez drzi
+// prodlouzeny awake watchdog.
 // Ochrana RTC: 2 sloty se sekvenci + magic/verze/velikost/CRC32, zapis vzdy do
 // starsiho slotu, ulozeni hned po bootu, watchdog pracuje jen se snapshotem.
 // =========================================================================
@@ -47,6 +55,16 @@
 #include <esp_attr.h>
 #include "ThingSpeak.h" // Oficialni knihovna pro bezpecny prenos dat
 
+// OTA (BLOCK 08): HTTPS, flash, podpis. JV_BEZ_OTA nastavuje jen nativni twin
+// (simulace/fw_twin_cpp), jehoz Arduino shim tyhle knihovny nema; na desce se nikdy nedefinuje.
+#ifndef JV_BEZ_OTA
+#include <HTTPClient.h>
+#include <Update.h>
+#include <WiFiClientSecure.h>
+#include "mbedtls/pk.h"
+#include "mbedtls/sha256.h"
+#endif
+
 // Knihovny pro senzory
 #include <Adafruit_Sensor.h>
 #include <Adafruit_BME280.h>
@@ -54,7 +72,9 @@
 #include <Adafruit_MPU6050.h>
 #include <DHT.h>
 
-#define FW_VERSION "1.2-lp"
+// Semver MAJOR.MINOR.PATCH (pripona za '-' se pri porovnani ignoruje). MUSI se
+// shodovat s tagem vydani vMAJOR.MINOR.PATCH - workflow to kontroluje.
+#define FW_VERSION "1.3.0"
 
 // Casove konstanty v milisekundach (puvodni hodnoty zachovany)
 #define INTERVAL_SPANKU_MS 90000       // perioda mereni (90 s, mereno od probuzeni k probuzeni)
@@ -96,6 +116,19 @@
 #define MQ_VZORKU 5
 #define MQ_PERIODA_VZORKU_MS 20
 
+// --- OTA (vychozi hodnoty; zivot je v portalu a v NVS) ---
+#define OTA_VYCHOZI_ZAPNUTO 1          // automaticka kontrola novych verzi
+#define OTA_VYCHOZI_INTERVAL_H 24      // jak casto kontrolovat (hodiny, 1..720)
+#define OTA_MAX_BACKOFF 3              // po neuspechu interval x2, x4, x8 (strop)
+#define OTA_POTVRZENI_CYKLU 3          // tolik dokoncenych cyklu potvrdi novy obraz
+#define OTA_MIN_TRIGGER_MS 600000UL    // trigger se ignoruje, kdyz kontrola bezela pred < 10 min
+#define OTA_LIMIT_BDENI_MS 180000UL    // awake watchdog behem OTA (TLS + ~1 MB stazeni)
+#define OTA_LIMIT_STAZENI_MS 150000UL  // strop jednoho stazeni obrazu
+#define OTA_MIN_HALDA 70000UL          // mene volne haldy nez tohle: TLS nezacinat
+// Zdroj: GitHub Releases. Pro test proti vlastnimu serveru vytvorte jv_ota_local.h
+// (je v .gitignore) a predefinujte JV_OTA_URL_ZAKLAD / JV_TB_HOST / JV_TB_PORT.
+#define JV_OTA_TYP "jvmeteo-" CONFIG_IDF_TARGET   // napr. jvmeteo-esp32c3; v podepsane zprave
+
 // 0 = ticho, 1 = chyby, 2 = souhrn cyklu
 #define DEBUG_LEVEL 2
 #define LOGE(...) do { if (DEBUG_LEVEL >= 1) { Serial.printf("[E] "); Serial.printf(__VA_ARGS__); Serial.println(); } } while (0)
@@ -119,6 +152,12 @@ String thingspeak_api = "DOPLNTE_THINGSPEAK_WRITE_API";
 
 // Stavy senzoru (zaskrtnuto/nezaskrtnuto)
 bool en_bme280 = true, en_bmp280 = false, en_dht22 = false, en_mpu6050 = false, en_mq9 = false;
+
+// OTA nastaveni (portal -> NVS "meteo")
+bool ota_povoleno = OTA_VYCHOZI_ZAPNUTO != 0;  // automaticka kontrola; rucni trigger funguje i pri vypnuti
+int ota_hodin = OTA_VYCHOZI_INTERVAL_H;        // interval automaticke kontroly
+String tb_id = "";                             // ThingSpeak TalkBack ID (prazdne = trigger vypnut)
+String tb_key = "";                            // TalkBack API klic (nikdy se nelogguje)
 
 // Definice pinu pro kazdy senzor zvlast (nastavitelne pres web)
 int bme_sda = 6, bme_scl = 7;
@@ -153,7 +192,26 @@ bool rezim_konfigurace = false;
 
 #define JV_POLI 7                       // ThingSpeak pole 1..7
 #define JV_RTC_MAGIC 0x4A564D32UL       // "JVM2"
-#define JV_RTC_VERZE 2
+#define JV_RTC_VERZE 3                  // 3: pribyla OTA pole (rezerva[3] nahrazena)
+
+#define JV_OTA_DOMENA "JVMETEO-OTA-SIG-v1"   // domena podpisu; zrt_ota.cpp pouziva jinou
+#define JV_OTA_MAX_VERZE 48
+#define JV_OTA_MAX_TYP 64
+#define JV_OTA_PREFIX_CAP (sizeof(JV_OTA_DOMENA) + JV_OTA_MAX_TYP + 1 + JV_OTA_MAX_VERZE + 1)
+#define JV_OTA_SIG_LEN 256
+#define JV_OTA_TRAILER (JV_OTA_SIG_LEN + 4)
+#define JV_OTA_MS_NEZNAMO 0xFFFFFFFFUL  // kontrola jeste nikdy nebezela -> splatna hned
+#define JV_OTA_MIN_HODIN 1
+#define JV_OTA_MAX_HODIN 720            // 30 dni; vic by se nevlezlo do uint32 ms s backoffem
+#define JV_OTA_PRIKAZ "OTA_CHECK"       // jediny prikaz, ktery TalkBack trigger zna
+
+enum JvOtaVysledek : uint8_t {
+  JV_OTA_AKTUALNI = 0,        // server nema novejsi verzi
+  JV_OTA_CHYBA_SITE = 1,      // verzi se nepodarilo zjistit
+  JV_OTA_CHYBA_STAZENI = 2,   // stazeni/zapis selhal, nic se neaktivovalo
+  JV_OTA_PODPIS_ODMITNUT = 3, // obraz se nestal aktivni, bezi dal stary
+  JV_OTA_NAINSTALOVANO = 4    // novy obraz je zapsany, nasleduje restart
+};
 
 enum JvBoot : uint8_t {
   JV_BOOT_COLD = 0,      // zapnuti napajeni / EN tlacitko
@@ -194,7 +252,11 @@ struct JvRtcState {
   uint8_t  wifiBssid[6];
   uint32_t wifiSsidHash;
   uint8_t  odeslanoMaska;     // bit i = pole i bylo v poslednim odeslani
-  uint8_t  rezerva[3];
+  uint8_t  otaChybStreak;     // po sobe jdouci neuspesne kontroly (backoff intervalu)
+  uint8_t  otaNepotvrzeno;    // 1 = bezi obraz z OTA, jeste neprosel potvrzovacim obdobim
+  uint8_t  otaCyklyPoInstalaci;
+  uint8_t  otaPozadavek;      // 1 = vzdaleny trigger chce kontrolu hned
+  uint32_t otaMsOdKontroly;   // reale ms od posledni kontroly (JV_OTA_MS_NEZNAMO = nikdy)
   float    odeslano[JV_POLI]; // posledni USPESNE odeslane hodnoty (baseline)
   uint32_t sekvence;          // poradi zapisu do RTC slotu (novejsi vyhrava)
   uint32_t msOdNapajeni;      // cas od zapnuti napajeni pres deep sleep (zhaveni MQ)
@@ -210,6 +272,11 @@ struct JvLadeni {
   uint32_t brownoutSpanekMs;
   uint32_t padSpanekMs;
   uint8_t  limitPadu;
+  bool     otaPovoleno;        // automaticka kontrola (rucni trigger funguje i bez ni)
+  uint32_t otaIntervalMs;      // jak casto kontrolovat
+  uint8_t  otaMaxBackoff;      // po neuspechu interval << min(streak, tohle)
+  uint8_t  otaPotvrzeniCyklu;  // kolik dokoncenych cyklu potvrdi novy obraz
+  uint32_t otaMinTriggerMs;    // trigger ignorovat, kdyz posledni kontrola byla driv nez tohle
 };
 
 struct JvPlan {
@@ -235,6 +302,7 @@ void jvStavInit(JvRtcState &s) {
   s.verze = JV_RTC_VERZE;
   s.velikost = (uint16_t)sizeof(JvRtcState);
   for (int i = 0; i < JV_POLI; i++) s.odeslano[i] = NAN;
+  s.otaMsOdKontroly = JV_OTA_MS_NEZNAMO;  // prvni uspesne odeslani rovnou zkontroluje verzi
 }
 
 void jvStavZapecetit(JvRtcState &s) {
@@ -306,6 +374,8 @@ bool jvBootStav(JvRtcState sloty[2], JvRtcState &s, JvBoot boot) {
 void jvPripoctiCas(JvRtcState &s, uint32_t ms) {
   const uint64_t v = (uint64_t)s.msOdNapajeni + ms;
   s.msOdNapajeni = v > 0xFFFFFFFFULL ? 0xFFFFFFFFUL : (uint32_t)v;
+  const uint64_t o = (uint64_t)s.otaMsOdKontroly + ms;  // saturuje na JV_OTA_MS_NEZNAMO = "splatna"
+  s.otaMsOdKontroly = o > 0xFFFFFFFFULL ? 0xFFFFFFFFUL : (uint32_t)o;
 }
 
 // Kolik ms jeste chybi do zahrati MQ (0 = zahraty). bdeniMs = millis() tohoto cyklu.
@@ -413,6 +483,152 @@ bool jvMamDetekovatKonfiguracniOkno(JvBoot boot) {
   return boot == JV_BOOT_COLD;
 }
 
+// ---------------------------------------------------------------------------
+// OTA: cisty rozhodovaci kod (bez site, bez flash). Sit a flash jsou v BLOCK 08.
+// ---------------------------------------------------------------------------
+
+// "v1.3.0", "1.3.0-rc1", "1.3" (patch = 0). Cokoli jineho (prazdne, "1.2-lp",
+// "1.3.0.5", "abc", cislo delsi nez 6 cifer) je neplatna verze.
+bool jvOtaParseVerze(const char *s, int v[3]) {
+  if (!s) return false;
+  while (*s == ' ' || *s == '\t') s++;
+  if (*s == 'v' || *s == 'V') s++;
+  v[0] = v[1] = v[2] = 0;
+  int i = 0;
+  while (i < 3) {
+    if (*s < '0' || *s > '9') return false;
+    long n = 0;
+    int cifer = 0;
+    while (*s >= '0' && *s <= '9') {
+      n = n * 10 + (*s - '0');
+      s++;
+      if (++cifer > 6) return false;
+    }
+    v[i++] = (int)n;
+    if (*s != '.') break;
+    s++;
+  }
+  if (i < 2) return false;  // aspon MAJOR.MINOR
+  return *s == '\0' || *s == '-' || *s == '+' || *s == ' ' || *s == '\r' || *s == '\n';
+}
+
+// true jen kdyz je serverova verze STRIKTNE vyssi. Stejna verze nebo starsi
+// (downgrade) = false; neplatna verze na kterekoli strane = false.
+bool jvOtaNovejsi(const char *server, const char *lokalni) {
+  int a[3], b[3];
+  if (!jvOtaParseVerze(server, a) || !jvOtaParseVerze(lokalni, b)) return false;
+  for (int i = 0; i < 3; i++) {
+    if (a[i] != b[i]) return a[i] > b[i];
+  }
+  return false;  // stejna verze neni novejsi (jinak by se aktualizovalo porad dokola)
+}
+
+// DOMENA\0 typ\0 verze\0 - cast podepsane zpravy, kterou zarizeni zna pred
+// stazenim. Vraci delku, 0 kdyz se typ/verze nevejdou nebo jsou prazdne.
+size_t jvOtaPrefix(uint8_t *out, size_t cap, const char *typ, const char *ver) {
+  const size_t d = sizeof(JV_OTA_DOMENA);  // vcetne NUL
+  const size_t t = strlen(typ) + 1;
+  const size_t v = strlen(ver) + 1;
+  if (t < 2 || t > JV_OTA_MAX_TYP + 1 || v < 2 || v > JV_OTA_MAX_VERZE + 1 || d + t + v > cap) return 0;
+  memcpy(out, JV_OTA_DOMENA, d);
+  memcpy(out + d, typ, t);
+  memcpy(out + d + t, ver, v);
+  return d + t + v;
+}
+
+uint32_t jvOtaHodinyNaMs(int hodin) {
+  if (hodin < JV_OTA_MIN_HODIN) hodin = JV_OTA_MIN_HODIN;
+  if (hodin > JV_OTA_MAX_HODIN) hodin = JV_OTA_MAX_HODIN;
+  return (uint32_t)hodin * 3600000UL;
+}
+
+// Po neuspesne kontrole se interval prodluzuje (x2, x4, x8), aby slaba sit nebo
+// vypadly server nevyzerali baterii.
+uint32_t jvOtaIntervalMs(const JvRtcState &s, const JvLadeni &t) {
+  const uint8_t n = s.otaChybStreak > t.otaMaxBackoff ? t.otaMaxBackoff : s.otaChybStreak;
+  const uint64_t v = (uint64_t)t.otaIntervalMs << n;
+  return v > 0xFFFFFFFEULL ? 0xFFFFFFFEUL : (uint32_t)v;
+}
+
+// Smi se TENTO cyklus zkontrolovat verzi? sitOk = ThingSpeak odeslani prave
+// uspelo (Wi-Fi bezi, signal je pouzitelny). Nikdy ne pri brownoutu/padech
+// (slaba baterie, TLS spicka by ji shodila) a nikdy dokud novy obraz neprosel
+// potvrzenim (zadne retezeni aktualizaci).
+bool jvOtaMaKontrolovat(const JvRtcState &s, JvBoot boot, bool sitOk, const JvLadeni &t) {
+  if (!sitOk) return false;
+  if (boot == JV_BOOT_BROWNOUT || s.brownoutStreak > 0 || s.padStreak > 0) return false;
+  if (s.otaNepotvrzeno) return false;
+  if (s.otaPozadavek) return s.otaMsOdKontroly >= t.otaMinTriggerMs;  // rucni: i pri vypnute automatice
+  if (!t.otaPovoleno) return false;
+  return s.otaMsOdKontroly >= jvOtaIntervalMs(s, t);
+}
+
+void jvOtaZadostTrigger(JvRtcState &s) { s.otaPozadavek = 1; }
+
+// Pesimisticky zapis PRED pokusem: kdyz se TLS/stazeni zasekne a probehne watchdog
+// nebo brownout, pokus je uz zapocitany a backoff plati i bez dalsiho kodu.
+void jvOtaPrijemZahajeni(JvRtcState &s) {
+  s.otaPozadavek = 0;
+  s.otaMsOdKontroly = 0;
+  s.otaChybStreak = jvSatInc(s.otaChybStreak);
+}
+
+void jvOtaPoKontrole(JvRtcState &s, JvOtaVysledek v) {
+  s.otaMsOdKontroly = 0;
+  s.otaPozadavek = 0;
+  if (v == JV_OTA_AKTUALNI) {
+    s.otaChybStreak = 0;
+  } else if (v == JV_OTA_NAINSTALOVANO) {
+    s.otaChybStreak = 0;
+    s.otaNepotvrzeno = 1;  // novy obraz bezi "na zkousku"
+    s.otaCyklyPoInstalaci = 0;
+  }
+  // ostatni vysledky: streak zustava zvyseny z jvOtaPrijemZahajeni
+}
+
+// Volat na konci kazdeho DOKONCENEHO mericiho cyklu. Obraz, ktery padne driv
+// nez cyklus dobehne, potvrzen nikdy nebude.
+void jvOtaPoCyklu(JvRtcState &s, const JvLadeni &t) {
+  if (!s.otaNepotvrzeno) return;
+  if (s.otaCyklyPoInstalaci < 255) s.otaCyklyPoInstalaci++;
+  if (s.otaCyklyPoInstalaci >= t.otaPotvrzeniCyklu) {
+    s.otaNepotvrzeno = 0;
+    s.otaCyklyPoInstalaci = 0;
+  }
+}
+
+// Novy obraz padl (limitPadu po sobe) driv, nez se potvrdil -> vratit predchozi slot.
+bool jvOtaRollbackNutny(const JvRtcState &s, const JvLadeni &t) {
+  return s.otaNepotvrzeno && s.padStreak >= t.limitPadu;
+}
+
+// Po rollbacku se na vadnou verzi dlouho nesaha: nejdelsi backoff.
+void jvOtaPoRollbacku(JvRtcState &s, const JvLadeni &t) {
+  s.otaNepotvrzeno = 0;
+  s.otaCyklyPoInstalaci = 0;
+  s.padStreak = 0;
+  s.otaChybStreak = t.otaMaxBackoff;
+  s.otaMsOdKontroly = 0;
+  s.otaPozadavek = 0;
+}
+
+// Telo odpovedi TalkBack "execute" je text prikazu (prazdne = fronta je prazdna).
+// Poznava jedinou vec: JV_OTA_PRIKAZ (bez ohledu na velikost pismen a okolni
+// mezery). Cokoli jineho se ignoruje - trigger nikdy nevybira URL ani verzi,
+// jen odstartuje stejnou kontrolu, jakou by udelal casovac.
+bool jvOtaPrikazJeKontrola(const char *telo) {
+  if (!telo) return false;
+  while (*telo == ' ' || *telo == '\t' || *telo == '\r' || *telo == '\n' || *telo == '"') telo++;
+  const char *p = JV_OTA_PRIKAZ;
+  while (*p) {
+    char c = *telo++;
+    if (c >= 'a' && c <= 'z') c = (char)(c - 'a' + 'A');
+    if (c != *p++) return false;
+  }
+  while (*telo == ' ' || *telo == '\t' || *telo == '\r' || *telo == '\n' || *telo == '"') telo++;
+  return *telo == '\0';
+}
+
 //-----------3-----------
 
 //-----------4-----------
@@ -441,6 +657,12 @@ void nastav_ladeni() {
   ladeni.brownoutSpanekMs = SPANEK_PO_BROWNOUT_MS;
   ladeni.padSpanekMs = SPANEK_PO_PADU_MS;
   ladeni.limitPadu = LIMIT_PADU_PO_SOBE;
+  // OTA: hodnoty z portalu (NVS) - volat AZ po nacti_konfiguraci().
+  ladeni.otaPovoleno = ota_povoleno;
+  ladeni.otaIntervalMs = jvOtaHodinyNaMs(ota_hodin);
+  ladeni.otaMaxBackoff = OTA_MAX_BACKOFF;
+  ladeni.otaPotvrzeniCyklu = OTA_POTVRZENI_CYKLU;
+  ladeni.otaMinTriggerMs = OTA_MIN_TRIGGER_MS;
 }
 
 JvBoot klasifikuj_boot() {
@@ -504,6 +726,14 @@ void spust_awake_watchdog() {
 
 void zastav_awake_watchdog() {
   if (awakeTimer) { esp_timer_stop(awakeTimer); }
+}
+
+// OTA potrebuje vic nez 30 s (TLS + stazeni ~1 MB). Mez zustava: zaseknuty
+// pokus skonci stejnym uspanim jako zaseknuta sit, jen pozdeji.
+void prodluz_awake_watchdog(uint32_t ms) {
+  if (!awakeTimer) return;
+  esp_timer_stop(awakeTimer);
+  esp_timer_start_once(awakeTimer, (uint64_t)ms * 1000ULL);
 }
 
 //-----------4-----------
@@ -795,8 +1025,9 @@ const char KONFIG_PAGE[] PROGMEM = R"rawliteral(
 <div class='pin'><span class='pin-name'>MQ-9</span><div class='field'><label>Analogový pin</label><input type='number' name='mq9_pin' value='%MQ9_PIN%' min='0' max='48'></div></div>
 </div></article>
 <article class='card wide'><h2 class='card-title'><span class='symbol'>⌁</span>Síť a ThingSpeak</h2><p class='hint'>Prázdné heslo Wi‑Fi nebo Write API klíč ponechá dosavadní uloženou hodnotu.</p><div class='network'><div><label>Název Wi‑Fi sítě (SSID)</label><input type='text' name='ssid' value='%SSID%' maxlength='32' required></div><div><label>Heslo Wi‑Fi</label><input type='password' name='pass' placeholder='Ponechat beze změny' maxlength='63'></div><div><label>ThingSpeak Write API klíč</label><input type='password' name='ts' placeholder='Ponechat beze změny' maxlength='32'></div></div></article>
+<article class='card wide'><h2 class='card-title'><span class='symbol'>⇪</span>Aktualizace firmware</h2><p class='hint'>Nová verze se stahuje z GitHub Releases a před instalací se ověří její podpis. Kontrola probíhá jen při odesílání na ThingSpeak, kdy je Wi‑Fi stejně zapnutá. Po neúspěchu se interval prodlužuje. Zapadlá aktualizace, která se nespustí, se sama vrátí na předchozí verzi.</p><div class='network'><div><label class='toggle'><input type='checkbox' name='en_ota' %OTA_CH%><span><span class='sensor-name'>Automatické aktualizace</span><span class='sensor-detail'>pravidelná kontrola nové verze</span></span></label></div><div><label>Kontrolovat každých (hodin, 1–720)</label><input type='number' name='ota_hod' value='%OTA_HOD%' min='1' max='720'></div><div><label>Nainstalovaná verze</label><input type='text' value='%FW%' readonly></div></div><p class='hint' style='margin-top:14px'>Vzdálená kontrola (nepovinné): vytvořte na ThingSpeaku aplikaci TalkBack a vložte její ID a klíč. Příkaz <b>OTA_CHECK</b> ve frontě pak spustí kontrolu při nejbližším odeslání, i když jsou automatické aktualizace vypnuté. Příkaz nikdy nevybírá, co se nainstaluje.</p><div class='network'><div><label>TalkBack ID</label><input type='text' name='tb_id' value='%TB_ID%' maxlength='12' inputmode='numeric'></div><div><label>TalkBack API klíč</label><input type='password' name='tb_key' placeholder='Ponechat beze změny' maxlength='24'></div></div></article>
 </section><button class='save' type='submit' name='ulozit' value='1'>Uložit nastavení a restartovat měření</button></form>
-<footer class='footer'><div class='coreon'>COREON</div><div class='firmware'>Firmware 1.2 · pro hardware 1.1 až 2.4</div><div class='notice'>Po uložení se stanice restartuje a spustí měřicí cyklus.</div></footer>
+<footer class='footer'><div class='coreon'>COREON</div><div class='firmware'>Firmware %FW% · pro hardware 1.1 až 2.4</div><div class='notice'>Po uložení se stanice restartuje a spustí měřicí cyklus.</div></footer>
 </main></body></html>
 )rawliteral";
 
@@ -818,6 +1049,10 @@ void nacti_konfiguraci() {
   mpu_scl = pref.getInt("mpu_scl", mpu_scl);
   dht_pin = pref.getInt("dht_pin", dht_pin);
   mq9_pin = pref.getInt("mq9_pin", mq9_pin);
+  ota_povoleno = pref.getBool("en_ota", ota_povoleno);
+  ota_hodin = pref.getInt("ota_hod", ota_hodin);
+  tb_id = pref.getString("tb_id", tb_id);
+  tb_key = pref.getString("tb_key", tb_key);
   pref.end();
 }
 
@@ -876,6 +1111,18 @@ void obsluha_konfig_web() {
     dht_pin = server.arg("dht_pin").toInt();
     mq9_pin = server.arg("mq9_pin").toInt();
 
+    ota_povoleno = server.hasArg("en_ota");
+    ota_hodin = server.arg("ota_hod").toInt();
+    if (ota_hodin < JV_OTA_MIN_HODIN || ota_hodin > JV_OTA_MAX_HODIN) { ota_hodin = OTA_VYCHOZI_INTERVAL_H; }
+    String novy_tb_id = server.arg("tb_id");
+    novy_tb_id.trim();
+    tb_id = "";
+    for (size_t i = 0; i < novy_tb_id.length(); i++) {  // jen cislice: ID jde do URL i do HTML
+      if (novy_tb_id[i] >= '0' && novy_tb_id[i] <= '9') { tb_id += novy_tb_id[i]; }
+    }
+    if (server.arg("tb_key").length() > 0) { tb_key = server.arg("tb_key"); tb_key.trim(); }
+    if (tb_id.length() == 0) { tb_key = ""; }  // bez ID se trigger nepouzije; klic nenechavat ladem
+
     pref.begin("meteo", false);
     pref.putString("ssid", wifi_ssid); pref.putString("pass", wifi_pass); pref.putString("ts", thingspeak_api);
     pref.putBool("en_bme", en_bme280); pref.putBool("en_bmp", en_bmp280); pref.putBool("en_mpu", en_mpu6050); pref.putBool("en_dht", en_dht22); pref.putBool("en_mq9", en_mq9);
@@ -883,6 +1130,8 @@ void obsluha_konfig_web() {
     pref.putInt("bmp_sda", bmp_sda); pref.putInt("bmp_scl", bmp_scl);
     pref.putInt("mpu_sda", mpu_sda); pref.putInt("mpu_scl", mpu_scl);
     pref.putInt("dht_pin", dht_pin); pref.putInt("mq9_pin", mq9_pin);
+    pref.putBool("en_ota", ota_povoleno); pref.putInt("ota_hod", ota_hodin);
+    pref.putString("tb_id", tb_id); pref.putString("tb_key", tb_key);
     pref.end();
 
     // Nova sit / senzory: zahodit cache BSSID, baseline i backoff.
@@ -906,6 +1155,10 @@ void obsluha_konfig_web() {
   page.replace("%MPU_SDA%", String(mpu_sda)); page.replace("%MPU_SCL%", String(mpu_scl));
   page.replace("%DHT_PIN%", String(dht_pin)); page.replace("%MQ9_PIN%", String(mq9_pin));
   page.replace("%SSID%", wifi_ssid);
+  page.replace("%OTA_CH%", ota_povoleno ? "checked" : "");
+  page.replace("%OTA_HOD%", String(ota_hodin));
+  page.replace("%TB_ID%", tb_id);
+  page.replace("%FW%", FW_VERSION);
 
   server.send(200, "text/html", page);
 }
@@ -926,7 +1179,264 @@ void spust_konfiguracni_ap() {
 //-----------7-----------
 
 //-----------8-----------
-// BLOCK 08: SLEEP (clean shutdown of radio and buses, then timer deep sleep)
+// BLOCK 08: OTA - GitHub Releases, podepsany obraz, rollback, trigger pres ThingSpeak TalkBack
+//
+// Prevzato z zonio_runtime/zrt_ota.cpp (ESP32 vetev, na HW overena) a upraveno pro
+// JVmeteo, ktery nema MQTT, Gate ani Zonio server:
+//   zdroj    GitHub Releases: <JV_OTA_URL_ZAKLAD><typ>.version.txt a <typ>.bin
+//            (github.com presmeruje 302 na CDN, bez basic auth)
+//   podpis   vlastni klic (jv_ota_pubkey.h) a domena JVMETEO-OTA-SIG-v1; typ + verze
+//            jsou v podepsane zprave -> obraz pro jiny cip ani starsi obraz neprojde
+//   bez      MQTT triggeru, Gate provisioningu a "minimal OTA boot" (ESP32 ma na
+//            TLS dost haldy i v aplikaci; ESP8266 varianta to resi restartem)
+//   navic    rollback na predchozi slot a trigger pres ThingSpeak TalkBack
+//
+// TLS bezi se setInsecure(): transport nedokazuje, kdo obraz poslal. O tom, co se
+// stane aktivnim, rozhoduje vyhradne podpis, overeny mezi poslednim zapisem a
+// Update.end(). Pri neplatnem podpisu se boot partition neprepne.
+
+#ifdef JV_BEZ_OTA
+// Nativni twin: OTA se nekompiluje, faze F_OTA jen preskoci.
+static void ota_krok() {}
+static void ota_rollback() {}
+#else  // JV_BEZ_OTA - cely zbytek bloku 08
+
+#if __has_include("jv_ota_local.h")
+#include "jv_ota_local.h"   // jen pro lokalni testy (v .gitignore): JV_OTA_URL_ZAKLAD, JV_TB_HOST, JV_TB_PORT
+#endif
+#include "jv_ota_pubkey.h"
+
+#ifndef JV_OTA_URL_ZAKLAD
+#define JV_OTA_URL_ZAKLAD "https://github.com/projectzonio/JV/releases/latest/download/"
+#endif
+#ifndef JV_TB_HOST
+#define JV_TB_HOST "api.thingspeak.com"
+#endif
+#ifndef JV_TB_PORT
+#define JV_TB_PORT 80
+#endif
+
+static bool ota_overit_podpis(const uint8_t hash[32], const uint8_t *sig) {
+  mbedtls_pk_context pk;
+  mbedtls_pk_init(&pk);
+  const char *pem = JV_OTA_PUBKEY_PEM;
+  const bool ok = mbedtls_pk_parse_public_key(&pk, (const unsigned char *)pem, strlen(pem) + 1) == 0 &&
+                  mbedtls_pk_get_type(&pk) == MBEDTLS_PK_RSA &&
+                  mbedtls_pk_get_bitlen(&pk) == 2048 &&
+                  mbedtls_pk_verify(&pk, MBEDTLS_MD_SHA256, hash, 32, sig, JV_OTA_SIG_LEN) == 0;
+  mbedtls_pk_free(&pk);
+  return ok;
+}
+
+struct JvSha256 {
+  mbedtls_sha256_context ctx;
+  JvSha256()  { mbedtls_sha256_init(&ctx); mbedtls_sha256_starts(&ctx, 0); }
+  ~JvSha256() { mbedtls_sha256_free(&ctx); }
+  void add(const uint8_t *p, size_t n) { mbedtls_sha256_update(&ctx, p, n); }
+  void finish(uint8_t out[32]) { mbedtls_sha256_finish(&ctx, out); }
+};
+
+// Proud firmware.bin do neaktivniho slotu: obraz se hashuje, trailer (podpis +
+// delka) se odklada. Vraci true jen kdyz dorazil kazdy bajt v ocekavane delce.
+static bool ota_stream(NetworkClient *in, size_t total, size_t imageSize, JvSha256 &sha,
+                       uint8_t trailer[JV_OTA_TRAILER]) {
+  uint8_t buf[1024];
+  size_t got = 0, tgot = 0;
+  const uint32_t start = millis();
+  uint32_t lastData = start;
+  int lastCtvrtina = -1;
+  while (got + tgot < total) {
+    if (millis() - start > OTA_LIMIT_STAZENI_MS) { LOGE("OTA: stazeni trva prilis dlouho"); return false; }
+    const size_t avail = in->available();
+    if (avail == 0) {
+      if (!in->connected() || millis() - lastData > 20000UL) { return false; }
+      vTaskDelay(1);
+      continue;
+    }
+    size_t chci = total - got - tgot;
+    if (chci > sizeof(buf)) chci = sizeof(buf);
+    if (chci > avail) chci = avail;
+    const int n = in->read(buf, chci);
+    if (n <= 0) continue;
+    lastData = millis();
+    size_t off = 0;
+    if (got < imageSize) {
+      size_t vezmi = imageSize - got;
+      if (vezmi > (size_t)n) vezmi = n;
+      if (Update.write(buf, vezmi) != vezmi) { LOGE("OTA: zapis do flash selhal: %s", Update.errorString()); return false; }
+      sha.add(buf, vezmi);
+      got += vezmi;
+      off = vezmi;
+      const int ctvrtina = (int)((got * 4) / imageSize);
+      if (ctvrtina != lastCtvrtina) { lastCtvrtina = ctvrtina; LOGI("OTA: stazeno %u/%u B", (unsigned)got, (unsigned)imageSize); }
+    }
+    if (off < (size_t)n) {
+      memcpy(trailer + tgot, buf + off, n - off);
+      tgot += n - off;
+    }
+  }
+  return got == imageSize && tgot == JV_OTA_TRAILER;
+}
+
+// Zkontroluje verzi a, je-li novejsi a podpis plati, zapise novy obraz do
+// neaktivniho slotu. Restart a stav RTC resi volajici (ota_krok).
+static JvOtaVysledek ota_zkontroluj_a_instaluj() {
+  const char *typ = JV_OTA_TYP;
+  if (ESP.getFreeHeap() < OTA_MIN_HALDA) {
+    LOGE("OTA: malo volne haldy (%lu B)", (unsigned long)ESP.getFreeHeap());
+    return JV_OTA_CHYBA_STAZENI;
+  }
+  const String urlVerze = String(JV_OTA_URL_ZAKLAD) + typ + ".version.txt";
+  const String urlObraz = String(JV_OTA_URL_ZAKLAD) + typ + ".bin";
+
+  WiFiClientSecure ssl;
+  ssl.setInsecure();  // viz hlavicka bloku: integritu drzi podpis, ne transport
+  HTTPClient https;
+  https.setReuse(false);
+  https.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+  https.setConnectTimeout(8000);
+  https.setTimeout(10000);
+  https.setUserAgent(String("JVmeteo/") + FW_VERSION);
+
+  // 1) verze (kratky text; velikost se overuje, aby podvrzeny server nenaplnil RAM)
+  if (!https.begin(ssl, urlVerze)) { LOGE("OTA: https.begin(verze) selhal"); return JV_OTA_CHYBA_SITE; }
+  const int kodVerze = https.GET();
+  String serverVer;
+  if (kodVerze == HTTP_CODE_OK) {
+    const int n = https.getSize();
+    if (n > 0 && n <= 64) { serverVer = https.getString(); serverVer.trim(); }
+    else { LOGE("OTA: velikost version.txt %d neni v 1..64", n); }
+  } else {
+    LOGE("OTA: kontrola verze HTTP %d", kodVerze);
+  }
+  https.end();
+  ssl.stop();
+  if (serverVer.length() == 0) { return JV_OTA_CHYBA_SITE; }
+  int v3[3];
+  if (!jvOtaParseVerze(serverVer.c_str(), v3)) { LOGE("OTA: neplatna verze na serveru"); return JV_OTA_CHYBA_SITE; }
+  LOGI("OTA: server %s, lokalni %s", serverVer.c_str(), FW_VERSION);
+  if (!jvOtaNovejsi(serverVer.c_str(), FW_VERSION)) { return JV_OTA_AKTUALNI; }
+
+  uint8_t prefix[JV_OTA_PREFIX_CAP];
+  const size_t prefixLen = jvOtaPrefix(prefix, sizeof(prefix), typ, serverVer.c_str());
+  if (prefixLen == 0) { LOGE("OTA: kontext podpisu je neplatny (typ/verze)"); return JV_OTA_PODPIS_ODMITNUT; }
+
+  // 2) obraz: image || sig[256] || u32le(256)
+  if (!https.begin(ssl, urlObraz)) { LOGE("OTA: https.begin(obraz) selhal"); return JV_OTA_CHYBA_STAZENI; }
+  const int kodObrazu = https.GET();
+  const int total = https.getSize();
+  if (kodObrazu != HTTP_CODE_OK || total <= (int)JV_OTA_TRAILER) {
+    LOGE("OTA: obraz HTTP %d, velikost %d", kodObrazu, total);
+    https.end();
+    // Zname delky kratsi nez trailer = nepodepsany obraz, odmitnout driv nez se cokoli zapise.
+    return (kodObrazu == HTTP_CODE_OK && total >= 0) ? JV_OTA_PODPIS_ODMITNUT : JV_OTA_CHYBA_STAZENI;
+  }
+  const size_t imageSize = (size_t)total - JV_OTA_TRAILER;
+  if (!Update.begin(imageSize, U_FLASH)) {
+    LOGE("OTA: Update.begin selhal: %s", Update.errorString());
+    https.end();
+    return JV_OTA_CHYBA_STAZENI;
+  }
+  JvSha256 sha;
+  sha.add(prefix, prefixLen);
+  uint8_t trailer[JV_OTA_TRAILER];
+  const bool kompletni = ota_stream(https.getStreamPtr(), (size_t)total, imageSize, sha, trailer);
+  https.end();  // uvolni TLS pred RSA overenim
+  if (!kompletni) {
+    Update.abort();
+    LOGE("OTA: stazeni neuplne, zruseno");
+    return JV_OTA_CHYBA_STAZENI;
+  }
+  uint8_t hash[32];
+  sha.finish(hash);
+  const uint32_t sigLen = (uint32_t)trailer[JV_OTA_SIG_LEN] | ((uint32_t)trailer[JV_OTA_SIG_LEN + 1] << 8) |
+                          ((uint32_t)trailer[JV_OTA_SIG_LEN + 2] << 16) | ((uint32_t)trailer[JV_OTA_SIG_LEN + 3] << 24);
+  if (sigLen != JV_OTA_SIG_LEN || !ota_overit_podpis(hash, trailer)) {
+    Update.abort();
+    LOGE("OTA: PODPIS NEPLATI - obraz neaktivovan, bezi dal stary firmware");
+    return JV_OTA_PODPIS_ODMITNUT;
+  }
+  if (!Update.end()) {
+    LOGE("OTA: Update.end selhal: %s", Update.errorString());
+    return JV_OTA_CHYBA_STAZENI;
+  }
+  LOGI("OTA: podpis OK, obraz %s zapsan", serverVer.c_str());
+  return JV_OTA_NAINSTALOVANO;
+}
+
+// Trigger pres infrastrukturu JVmeteo: ThingSpeak TalkBack. Zarizeni se same
+// ptaji (POST .../commands/execute), nic nemusi poslouchat. Prikaz se z fronty
+// odebere pri precteni, takze se neopakuje. Plain HTTP stejne jako zapis na
+// ThingSpeak - bez dalsi TLS relace, ktera by na baterii stala vic nez samotny trigger.
+static bool ota_trigger_pozadan() {
+  if (tb_id.length() == 0 || tb_key.length() == 0 || WiFi.status() != WL_CONNECTED) { return false; }
+  WiFiClient tbClient;  // 'client' z BLOCK 02 patri knihovne ThingSpeak
+  HTTPClient http;
+  http.setReuse(false);
+  http.setConnectTimeout(4000);
+  http.setTimeout(4000);
+  if (!http.begin(tbClient, JV_TB_HOST, JV_TB_PORT, String("/talkbacks/") + tb_id + "/commands/execute")) { return false; }
+  http.addHeader("Content-Type", "application/x-www-form-urlencoded");
+  const int kod = http.POST(String("api_key=") + tb_key);
+  String telo;
+  if (kod == HTTP_CODE_OK) {
+    const int n = http.getSize();
+    if (n <= 64) { telo = http.getString(); }  // -1 = chunked; delka se kontroluje nize
+  } else {
+    LOGE("OTA: TalkBack HTTP %d", kod);
+  }
+  http.end();
+  return telo.length() <= 64 && jvOtaPrikazJeKontrola(telo.c_str());
+}
+
+// Fáze F_OTA: trigger, plan, pokus. Blokuje (TLS + stazeni); mez drzi watchdog.
+static void ota_krok() {
+  if (ota_trigger_pozadan()) {
+    jvOtaZadostTrigger(rtcStav);
+    LOGI("OTA: prisel trigger (TalkBack)");
+  }
+  if (!jvOtaMaKontrolovat(rtcStav, bootTyp, true, ladeni)) { return; }
+
+  LOGI("OTA: kontrola verze (fw %s, trigger=%d, streak=%u)", FW_VERSION, rtcStav.otaPozadavek, rtcStav.otaChybStreak);
+  jvOtaPrijemZahajeni(rtcStav);
+  jvSlotyUloz(rtcSloty, rtcStav);  // pokus je zapocitany, i kdyz ho zabije watchdog/brownout
+  prodluz_awake_watchdog(OTA_LIMIT_BDENI_MS);
+  setCpuFrequencyMhz(160);         // TLS + SHA-256 + RSA behem stazeni
+
+  const JvOtaVysledek v = ota_zkontroluj_a_instaluj();
+  jvOtaPoKontrole(rtcStav, v);
+  if (v == JV_OTA_NAINSTALOVANO) {
+    zastav_awake_watchdog();
+    jvSlotyUloz(rtcSloty, rtcStav);  // otaNepotvrzeno = 1: rollback hlida novy obraz
+    LOGI("OTA: restart do noveho firmware");
+    Serial.flush();
+    vTaskDelay(pdMS_TO_TICKS(200));
+    ESP.restart();
+  }
+  setCpuFrequencyMhz(CPU_FREKVENCE_MHZ);
+  LOGI("OTA: vysledek=%d streak=%u", (int)v, rtcStav.otaChybStreak);
+}
+
+// Novy obraz padl driv, nez se potvrdil: vratit predchozi slot. Vola se z setup()
+// hned po nacteni RTC stavu.
+static void ota_rollback() {
+  LOGE("OTA: novy obraz opakovane padl, vracim predchozi firmware");
+  const bool lze = Update.canRollBack();
+  jvOtaPoRollbacku(rtcStav, ladeni);
+  jvSlotyUloz(rtcSloty, rtcStav);
+  if (lze && Update.rollBack()) {
+    Serial.flush();
+    ESP.restart();
+  }
+  LOGE("OTA: rollback nelze (predchozi slot neni platny), pokracuji");
+}
+
+#endif  // JV_BEZ_OTA
+
+//-----------8-----------
+
+//-----------9-----------
+// BLOCK 09: SLEEP (clean shutdown of radio and buses, then timer deep sleep)
 
 void uspani(uint32_t spanekMs, uint32_t bdeniMs) {
   if (uspavaniZahajeno.exchange(true)) return;  // awake watchdog uz uspava
@@ -940,15 +1450,16 @@ void uspani(uint32_t spanekMs, uint32_t bdeniMs) {
   esp_deep_sleep_start();
 }
 
-//-----------8-----------
-
 //-----------9-----------
-// BLOCK 09: SETUP / LOOP ORCHESTRATION
+
+//-----------10-----------
+// BLOCK 10: SETUP / LOOP ORCHESTRATION
 
 // Merici cyklus jako stavovy automat volany z loop(): zadna faze neceka
 // v delay(), casovani hlida millis(). Soubezne bezi konfiguracni okno po
-// zapnuti a vzorkovani MQ-9.
-enum Faze : uint8_t { F_SENZORY, F_CEKEJ_MQ, F_PLAN, F_WIFI, F_ODESLI, F_KONEC, F_SPANEK };
+// zapnuti a vzorkovani MQ-9. F_OTA (BLOCK 08) je vyjimka: blokuje, ale jen po
+// uspesnem odeslani a jen kdyz je kontrola splatna nebo prisel trigger.
+enum Faze : uint8_t { F_SENZORY, F_CEKEJ_MQ, F_PLAN, F_WIFI, F_ODESLI, F_OTA, F_KONEC, F_SPANEK };
 Faze faze = F_SENZORY;
 JvPlan plan = { 0, false };
 float cur[JV_POLI];
@@ -981,10 +1492,15 @@ void merici_krok() {
       // Komunikace zustava puvodni; horni mez bdeni drzi awake watchdog.
       odeslanoOk = odesli_na_thingspeak();
       jvPoSiti(rtcStav, odeslanoOk, cur, odeslanoOk ? (int8_t)WiFi.RSSI() : (int8_t)0, ladeni);
+      faze = odeslanoOk ? F_OTA : F_KONEC;
+      break;
+    case F_OTA:
+      ota_krok();  // restartuje, pokud nainstalovala novy firmware
       faze = F_KONEC;
       break;
     case F_KONEC:
       jvKonecCyklu(rtcStav, plan.sit, odeslanoOk, jvMaskaPlatnych(cur) != 0);
+      jvOtaPoCyklu(rtcStav, ladeni);  // novy obraz se potvrdi po OTA_POTVRZENI_CYKLU dokoncenych cyklech
       faze = F_SPANEK;
       break;
     case F_SPANEK: {
@@ -1006,16 +1522,18 @@ void setup() {
   Serial.begin(115200);
 
   bootTyp = klasifikuj_boot();
+  nacti_konfiguraci();   // pred nastav_ladeni(): OTA volby jsou v NVS
   nastav_ladeni();
   nacti_rtc_stav();
-  LOGI("JVmeteo %s, boot=%s #%lu, ok=%lu chyb=%lu, awake_timeout=%u",
+  LOGI("JVmeteo %s, boot=%s #%lu, ok=%lu chyb=%lu, awake_timeout=%u ota=%s/%dh%s",
        FW_VERSION, nazev_bootu(bootTyp), (unsigned long)rtcStav.pocetBootu,
        (unsigned long)rtcStav.odeslanoOk, (unsigned long)rtcStav.odeslanoChyba,
-       rtcStav.awakeTimeouty);
+       rtcStav.awakeTimeouty, ota_povoleno ? "auto" : "rucne", ota_hodin,
+       rtcStav.otaNepotvrzeno ? " NEPOTVRZENO" : "");
+  if (jvOtaRollbackNutny(rtcStav, ladeni)) { ota_rollback(); }
 
   // Inicializace ThingSpeak komunikacni vrstvy skrze WiFiClient objekt
   ThingSpeak.begin(client);
-  nacti_konfiguraci();
 
   if (jvMamDetekovatKonfiguracniOkno(bootTyp)) {
     rezim_konfigurace = okno_start();
@@ -1042,4 +1560,4 @@ void loop() {
   vTaskDelay(1);
 }
 
-//-----------9-----------
+//-----------10-----------

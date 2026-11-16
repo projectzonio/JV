@@ -1,0 +1,164 @@
+name: firmware
+
+# test  -> host test logiky (vcetne mutaci)
+# build -> preklad ESP32-C3, BEZ tajemstvi (knihovny z Library Manageru jsou cizi kod)
+# release (jen tag vX.Y.Z) -> podpis klicem z environmentu "release", overeni proti
+#   klici zabudovanemu ve firmware, publikace GitHub Release.
+#
+# Zarizeni stahuji z .../releases/latest/download/, coz je nejnovejsi NE-prerelease.
+# Tag s priponou (v1.4.0-rc1) vznikne jako prerelease a zarizeni ho nevidi.
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+      - "v[0-9]+.[0-9]+.[0-9]+-*"
+  pull_request:
+    paths:
+      - "jvmeteook2/**"
+      - ".github/workflows/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  FQBN: esp32:esp32:esp32c3
+  OTA_TYPE: jvmeteo-esp32c3          # musi odpovidat JV_OTA_TYP ve firmware
+  ESP32_CORE: "3.2.1"
+  SKETCH: jvmeteook2
+  ARDUINO_BOARD_MANAGER_ADDITIONAL_URLS: https://espressif.github.io/arduino-esp32/package_esp32_index.json
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Host test (BLOCK 03 + mutace + krizova kontrola prefixu podpisu)
+        run: python3 jvmeteook2/test/host/run_host_test.py
+
+  build:
+    needs: test
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Verze v kodu odpovida tagu
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          VER="${GITHUB_REF_NAME#v}"
+          if ! grep -qF "#define FW_VERSION \"${VER}\"" "${SKETCH}/jvmeteook2.ino"; then
+            echo "::error::FW_VERSION v ${SKETCH}/jvmeteook2.ino neodpovida tagu ${GITHUB_REF_NAME}"
+            grep -n '#define FW_VERSION' "${SKETCH}/jvmeteook2.ino" || true
+            exit 1
+          fi
+
+      - uses: arduino/setup-arduino-cli@81d310742121c928ea9c8bbd407b4217b432ae02 # v2.0.0
+        with:
+          version: 1.2.0
+
+      - name: Jadro a knihovny (pripnute verze)
+        run: |
+          arduino-cli core update-index
+          arduino-cli core install "esp32:esp32@${ESP32_CORE}"
+          arduino-cli lib install \
+            "ThingSpeak@2.1.1" \
+            "Adafruit BME280 Library@2.2.4" \
+            "Adafruit BMP280 Library@2.6.8" \
+            "Adafruit MPU6050@2.2.9" \
+            "Adafruit Unified Sensor@1.1.15" \
+            "Adafruit BusIO@1.17.4" \
+            "DHT sensor library@1.4.7"
+
+      - name: Preklad
+        run: |
+          arduino-cli compile --fqbn "${FQBN}" --warnings default \
+            --output-dir out "${SKETCH}" | tee compile.log
+          test -s "out/${SKETCH}.ino.bin"
+          grep -E "Sketch uses" compile.log
+
+      - name: Nepodepsane vystupy
+        run: |
+          mkdir -p dist
+          cp "out/${SKETCH}.ino.bin" dist/app.bin
+          cp "out/${SKETCH}.ino.merged.bin" dist/usb-full-unsigned.bin
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: build
+          path: dist/
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    # Jedine misto, kde existuje tajny klic. Secret OTA_SIGNING_KEY patri do
+    # environmentu "release" (Settings -> Environments); tam jde pozadat o schvaleni.
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-24.04
+    environment: release
+    permissions:
+      contents: write
+    concurrency:
+      group: release-${{ github.ref_name }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: build
+          path: dist/
+
+      - name: Podpis a overeni
+        env:
+          OTA_SIGNING_KEY: ${{ secrets.OTA_SIGNING_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${OTA_SIGNING_KEY}" ]; then
+            echo "::error::Chybi secret OTA_SIGNING_KEY v environmentu 'release'"
+            exit 1
+          fi
+          VER="${GITHUB_REF_NAME#v}"
+          umask 077
+          KEY="$(mktemp)"
+          trap 'shred -u "${KEY}" 2>/dev/null || rm -f "${KEY}"' EXIT
+          printf '%s\n' "${OTA_SIGNING_KEY}" > "${KEY}"
+
+          SIGN="${SKETCH}/tools/ota/sign_ota.py"
+          python3 "${SIGN}" sign --in dist/app.bin --key "${KEY}" \
+            --type "${OTA_TYPE}" --version "${VER}" --out "dist/${OTA_TYPE}.bin"
+          # Overeni proti klici, ktery je ve FIRMWARE (ne proti klici, ktery tu chceme mit):
+          # kdyby secret nesedel, vznikl by release, ktery zadne zarizeni neprijme.
+          python3 "${SIGN}" verify --in "dist/${OTA_TYPE}.bin" \
+            --pub-header "${SKETCH}/jv_ota_pubkey.h" --type "${OTA_TYPE}" --version "${VER}"
+          # Negativni kontrola: stejny soubor pod jinou verzi MUSI selhat, jinak overeni nic nemeri.
+          if python3 "${SIGN}" verify --in "dist/${OTA_TYPE}.bin" \
+               --pub-header "${SKETCH}/jv_ota_pubkey.h" --type "${OTA_TYPE}" --version "0.0.0"; then
+            echo "::error::overeni prijalo podpis pro jinou verzi - kontrola je slepa"
+            exit 1
+          fi
+
+          printf '%s' "${VER}" > "dist/${OTA_TYPE}.version.txt"
+          cp dist/usb-full-unsigned.bin "dist/${OTA_TYPE}-usb-full-${VER}.bin"
+          rm -f dist/app.bin dist/usb-full-unsigned.bin
+          ( cd dist && sha256sum * > SHA256SUMS && cat SHA256SUMS )
+
+      - name: Publikace
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          PRE=""
+          case "${GITHUB_REF_NAME}" in *-*) PRE="--prerelease" ;; esac
+          # Nejdriv koncept s priloham, teprve potom zverejneni: zarizeni nikdy
+          # neuvidi release, ktery ma jen cast souboru.
+          gh release create "${GITHUB_REF_NAME}" dist/* --draft ${PRE} \
+            --title "JVmeteo ${GITHUB_REF_NAME}" --generate-notes
+          gh release edit "${GITHUB_REF_NAME}" --draft=false

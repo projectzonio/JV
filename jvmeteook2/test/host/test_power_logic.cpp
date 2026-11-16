@@ -26,6 +26,11 @@ static JvLadeni ladeni_default() {
   t.brownoutSpanekMs = 600000;
   t.padSpanekMs = 600000;
   t.limitPadu = 3;
+  t.otaPovoleno = true;
+  t.otaIntervalMs = 24UL * 3600000UL;
+  t.otaMaxBackoff = 3;
+  t.otaPotvrzeniCyklu = 3;
+  t.otaMinTriggerMs = 600000UL;
   return t;
 }
 
@@ -269,6 +274,194 @@ int main() {
     CHECK("T15 po 180 s zahraty", jvMqZbyvaMs(s, 0, 180000) == 0);
     jvBootStav(sl, s, JV_BOOT_COLD);
     CHECK("T15 nove zapnuti -> zhaveni znovu", jvMqZbyvaMs(s, 0, 180000) == 180000UL);
+  }
+
+  // ---------------------------------------------------------------------------
+  // OTA (T16-T22)
+  // ---------------------------------------------------------------------------
+
+  // T16 verze: numericky porovnani, striktne vyssi, neplatne vstupy nikdy "novejsi"
+  {
+    CHECK("T16 1.3.0 > 1.2.9", jvOtaNovejsi("1.3.0", "1.2.9"));
+    CHECK("T16 1.10.0 > 1.9.9 (cisla, ne text)", jvOtaNovejsi("1.10.0", "1.9.9"));
+    CHECK("T16 2.0.0 > 1.99.99", jvOtaNovejsi("2.0.0", "1.99.99"));
+    CHECK("T16 1.3.1 > 1.3.0", jvOtaNovejsi("1.3.1", "1.3.0"));
+    CHECK("T16 v1.4 > 1.3.9 (prefix v, bez patch)", jvOtaNovejsi("v1.4", "1.3.9"));
+    CHECK("T16 stejna verze neni novejsi", !jvOtaNovejsi("1.3.0", "1.3.0"));
+    CHECK("T16 pripona se ignoruje: 1.3.0-rc1 vs 1.3.0", !jvOtaNovejsi("1.3.0-rc1", "1.3.0"));
+    CHECK("T16 downgrade 1.2.0 vs 1.3.0", !jvOtaNovejsi("1.2.0", "1.3.0"));
+    CHECK("T16 downgrade 0.9.9 vs 1.0.0", !jvOtaNovejsi("0.9.9", "1.0.0"));
+    CHECK("T16 starsi nazev 1.2-lp je platna verze 1.2.0", jvOtaNovejsi("1.3.0", "1.2-lp"));
+    const char *spatne[] = { "", "abc", "1", "1.", "1.3.", ".3.0", "1.3.0.5", "1.3.x", "1..3", "9999999.0.0", "v", " ", "1.3.0abc" };
+    bool zadna_novejsi = true, zadna_platna = true;
+    for (const char *s : spatne) {
+      int v[3];
+      if (jvOtaNovejsi(s, "1.0.0")) zadna_novejsi = false;
+      if (jvOtaParseVerze(s, v)) zadna_platna = false;
+    }
+    CHECK("T16 neplatna verze na serveru nikdy neaktualizuje", zadna_novejsi);
+    CHECK("T16 neplatne retezce se neparsuji", zadna_platna);
+    CHECK("T16 neplatna lokalni verze -> nikdy novejsi", !jvOtaNovejsi("9.9.9", "garbage"));
+    CHECK("T16 NULL bezpecne", !jvOtaNovejsi(nullptr, "1.0.0") && !jvOtaNovejsi("1.0.0", nullptr));
+  }
+
+  // T17 prefix podpisu: DOMENA\0 typ\0 verze\0, hranice delek
+  {
+    uint8_t out[JV_OTA_PREFIX_CAP];
+    const size_t n = jvOtaPrefix(out, sizeof(out), "jvmeteo-esp32c3", "1.3.1");
+    const size_t ocekavano = sizeof(JV_OTA_DOMENA) + strlen("jvmeteo-esp32c3") + 1 + strlen("1.3.1") + 1;
+    CHECK("T17 delka prefixu = domena+NUL + typ+NUL + verze+NUL", n == ocekavano);
+    CHECK("T17 zacina domenou a NUL", n > 0 && memcmp(out, "JVMETEO-OTA-SIG-v1\0jvmeteo-esp32c3\0" "1.3.1\0", n) == 0);
+    uint8_t jiny[JV_OTA_PREFIX_CAP];
+    const size_t m = jvOtaPrefix(jiny, sizeof(jiny), "jvmeteo-esp32s3", "1.3.1");
+    CHECK("T17 jiny cip -> jiny prefix", m == n && memcmp(out, jiny, n) != 0);
+    const size_t k = jvOtaPrefix(jiny, sizeof(jiny), "jvmeteo-esp32c3", "1.3.2");
+    CHECK("T17 jina verze -> jiny prefix", k == n && memcmp(out, jiny, n) != 0);
+    char dlouha[80]; memset(dlouha, '1', sizeof(dlouha) - 1); dlouha[sizeof(dlouha) - 1] = 0;
+    CHECK("T17 verze nad 48 znaku -> 0", jvOtaPrefix(out, sizeof(out), "jvmeteo-esp32c3", dlouha) == 0);
+    CHECK("T17 typ nad 64 znaku -> 0", jvOtaPrefix(out, sizeof(out), dlouha, "1.3.1") == 0);
+    CHECK("T17 prazdna verze -> 0", jvOtaPrefix(out, sizeof(out), "jvmeteo-esp32c3", "") == 0);
+    CHECK("T17 prazdny typ -> 0", jvOtaPrefix(out, sizeof(out), "", "1.3.1") == 0);
+    CHECK("T17 maly buffer -> 0", jvOtaPrefix(out, 10, "jvmeteo-esp32c3", "1.3.1") == 0);
+    // Vystup pro krizovou kontrolu se signerem (run_host_test.py ho porovna s tools/ota/sign_ota.py).
+    const size_t p = jvOtaPrefix(out, sizeof(out), "jvmeteo-esp32c3", "1.3.1");
+    printf("PREFIX jvmeteo-esp32c3 1.3.1 ");
+    for (size_t i = 0; i < p; i++) printf("%02x", out[i]);
+    printf("\n");
+  }
+
+  // T18 plan kontrol: prvni po zapnuti, interval, backoff, trigger, pojistky
+  {
+    JvRtcState s; jvStavInit(s);
+    const JvLadeni t24 = t;
+    CHECK("T18 hodiny -> ms (24 h)", jvOtaHodinyNaMs(24) == 86400000UL);
+    CHECK("T18 hodiny pod minimem -> 1 h", jvOtaHodinyNaMs(0) == 3600000UL && jvOtaHodinyNaMs(-5) == 3600000UL);
+    CHECK("T18 hodiny nad maximem -> 720 h", jvOtaHodinyNaMs(99999) == 720UL * 3600000UL);
+    CHECK("T18 po zapnuti je prvni kontrola splatna hned", jvOtaMaKontrolovat(s, JV_BOOT_COLD, true, t24));
+    CHECK("T18 bez uspesneho odeslani se nekontroluje", !jvOtaMaKontrolovat(s, JV_BOOT_COLD, false, t24));
+    JvLadeni vyp = t24; vyp.otaPovoleno = false;
+    CHECK("T18 auto-update vypnuty -> nekontroluje", !jvOtaMaKontrolovat(s, JV_BOOT_COLD, true, vyp));
+    JvRtcState r = s; jvOtaZadostTrigger(r);
+    CHECK("T18 trigger funguje i pri vypnute automatice", jvOtaMaKontrolovat(r, JV_BOOT_COLD, true, vyp));
+
+    // po uspesne kontrole: ticho do uplynuti intervalu
+    jvOtaPrijemZahajeni(s); jvOtaPoKontrole(s, JV_OTA_AKTUALNI);
+    CHECK("T18 po kontrole neni splatna", !jvOtaMaKontrolovat(s, JV_BOOT_DEEPSLEEP, true, t24));
+    jvPripoctiCas(s, 24UL * 3600000UL - 1UL);
+    CHECK("T18 o 1 ms pred intervalem neni splatna", !jvOtaMaKontrolovat(s, JV_BOOT_DEEPSLEEP, true, t24));
+    jvPripoctiCas(s, 1UL);
+    CHECK("T18 po intervalu je splatna", jvOtaMaKontrolovat(s, JV_BOOT_DEEPSLEEP, true, t24));
+
+    // backoff po neuspechu: interval x2, x4, x8, strop x8
+    JvRtcState b; jvStavInit(b);
+    const uint32_t zaklad = t24.otaIntervalMs;
+    const uint32_t ocek[6] = { 2, 4, 8, 8, 8, 8 };
+    bool backoff_ok = true;
+    for (int i = 0; i < 6; i++) {
+      jvOtaPrijemZahajeni(b); jvOtaPoKontrole(b, JV_OTA_CHYBA_SITE);
+      if (jvOtaIntervalMs(b, t24) != zaklad * ocek[i]) backoff_ok = false;
+    }
+    CHECK("T18 po neuspechu se interval prodluzuje x2,x4,x8 a strop je x8", backoff_ok);
+    jvPripoctiCas(b, zaklad * 8UL - 1UL);
+    CHECK("T18 pod prodlouzenym intervalem se nekontroluje", !jvOtaMaKontrolovat(b, JV_BOOT_DEEPSLEEP, true, t24));
+    jvPripoctiCas(b, 1UL);
+    CHECK("T18 po prodlouzenem intervalu ano", jvOtaMaKontrolovat(b, JV_BOOT_DEEPSLEEP, true, t24));
+    jvOtaPrijemZahajeni(b); jvOtaPoKontrole(b, JV_OTA_AKTUALNI);
+    CHECK("T18 uspech nuluje backoff", b.otaChybStreak == 0 && jvOtaIntervalMs(b, t24) == zaklad);
+
+    // zapocteny pokus preziva zaseknuti: kdyz se po Zahajeni nic nezavola, streak uz je zvyseny
+    JvRtcState h; jvStavInit(h);
+    jvOtaPrijemZahajeni(h);
+    CHECK("T18 zaseknuty pokus (bez PoKontrole) uz je zapocitany", h.otaChybStreak == 1 && h.otaMsOdKontroly == 0);
+
+    // trigger: cooldown, jinak by stale prikaz zahlcoval radio
+    JvRtcState c; jvStavInit(c);
+    jvOtaPrijemZahajeni(c); jvOtaPoKontrole(c, JV_OTA_AKTUALNI);
+    jvOtaZadostTrigger(c);
+    CHECK("T18 trigger hned po kontrole se ignoruje (cooldown)", !jvOtaMaKontrolovat(c, JV_BOOT_DEEPSLEEP, true, t24));
+    jvPripoctiCas(c, 600000UL);
+    CHECK("T18 trigger po cooldownu projde", jvOtaMaKontrolovat(c, JV_BOOT_DEEPSLEEP, true, t24));
+
+    // pojistky: slaba baterie / nestabilita / nepotvrzeny obraz
+    JvRtcState p; jvStavInit(p);
+    CHECK("T18 brownout boot -> nekontroluje", !jvOtaMaKontrolovat(p, JV_BOOT_BROWNOUT, true, t24));
+    p.brownoutStreak = 1;
+    CHECK("T18 brownoutStreak -> nekontroluje", !jvOtaMaKontrolovat(p, JV_BOOT_DEEPSLEEP, true, t24));
+    p.brownoutStreak = 0; p.padStreak = 1;
+    CHECK("T18 padStreak -> nekontroluje", !jvOtaMaKontrolovat(p, JV_BOOT_DEEPSLEEP, true, t24));
+    p.padStreak = 0; p.otaNepotvrzeno = 1;
+    CHECK("T18 nepotvrzeny obraz -> zadne retezeni aktualizaci", !jvOtaMaKontrolovat(p, JV_BOOT_DEEPSLEEP, true, t24));
+    jvOtaZadostTrigger(p);
+    CHECK("T18 ani trigger neprebije nepotvrzeny obraz", !jvOtaMaKontrolovat(p, JV_BOOT_DEEPSLEEP, true, t24));
+  }
+
+  // T19 instalace, potvrzeni a rollback
+  {
+    JvRtcState s; jvStavInit(s);
+    jvOtaPrijemZahajeni(s); jvOtaPoKontrole(s, JV_OTA_NAINSTALOVANO);
+    CHECK("T19 po instalaci je obraz nepotvrzeny", s.otaNepotvrzeno == 1 && s.otaCyklyPoInstalaci == 0 && s.otaChybStreak == 0);
+    jvOtaPoCyklu(s, t); jvOtaPoCyklu(s, t);
+    CHECK("T19 po 2 cyklech je stale nepotvrzeny", s.otaNepotvrzeno == 1);
+    jvOtaPoCyklu(s, t);
+    CHECK("T19 po 3 cyklech je potvrzeny", s.otaNepotvrzeno == 0 && s.otaCyklyPoInstalaci == 0);
+
+    // obraz, ktery pada: 3 pady po sobe pred potvrzenim -> rollback
+    JvRtcState sl[2]; memset(sl, 0xA5, sizeof(sl));
+    JvRtcState n;
+    jvBootStav(sl, n, JV_BOOT_COLD);
+    jvOtaPrijemZahajeni(n); jvOtaPoKontrole(n, JV_OTA_NAINSTALOVANO); jvSlotyUloz(sl, n);
+    jvBootStav(sl, n, JV_BOOT_SOFT);  // restart po instalaci
+    CHECK("T19 po restartu je obraz stale nepotvrzeny, rollback nehrozi", n.otaNepotvrzeno == 1 && !jvOtaRollbackNutny(n, t));
+    jvBootStav(sl, n, JV_BOOT_CRASH); jvBootStav(sl, n, JV_BOOT_CRASH);
+    CHECK("T19 2 pady jeste nejsou rollback", !jvOtaRollbackNutny(n, t));
+    jvBootStav(sl, n, JV_BOOT_CRASH);
+    CHECK("T19 3 pady pred potvrzenim -> rollback", jvOtaRollbackNutny(n, t));
+    jvOtaPoRollbacku(n, t);
+    CHECK("T19 po rollbacku neni nepotvrzeny a padStreak je nulovy", n.otaNepotvrzeno == 0 && n.padStreak == 0);
+    CHECK("T19 po rollbacku nejdelsi backoff (vadna verze se hned nestahuje znovu)",
+          jvOtaIntervalMs(n, t) == t.otaIntervalMs * 8UL && !jvOtaMaKontrolovat(n, JV_BOOT_DEEPSLEEP, true, t));
+
+    // negativni kontroly: potvrzeny obraz se kvuli padum nevraci
+    JvRtcState g; jvStavInit(g); g.padStreak = 3;
+    CHECK("T19 potvrzeny obraz (otaNepotvrzeno=0) se nevraci ani po 3 padech", !jvOtaRollbackNutny(g, t));
+  }
+
+  // T20 TalkBack prikaz: jen OTA_CHECK, nic jineho
+  {
+    CHECK("T20 OTA_CHECK", jvOtaPrikazJeKontrola("OTA_CHECK"));
+    CHECK("T20 male pismena a bile znaky", jvOtaPrikazJeKontrola("  ota_check\r\n"));
+    CHECK("T20 v uvozovkach", jvOtaPrikazJeKontrola("\"OTA_CHECK\""));
+    CHECK("T20 prazdna fronta", !jvOtaPrikazJeKontrola(""));
+    CHECK("T20 prazdny JSON", !jvOtaPrikazJeKontrola("{}"));
+    CHECK("T20 jiny prikaz", !jvOtaPrikazJeKontrola("REBOOT"));
+    CHECK("T20 prefix prikazu", !jvOtaPrikazJeKontrola("OTA"));
+    CHECK("T20 prikaz s priponou", !jvOtaPrikazJeKontrola("OTA_CHECK2"));
+    CHECK("T20 prikaz s argumentem (URL/verze nelze vybrat)", !jvOtaPrikazJeKontrola("OTA_CHECK http://evil/x.bin"));
+    CHECK("T20 NULL", !jvOtaPrikazJeKontrola(nullptr));
+  }
+
+  // T21 cas pro OTA tece pres deep sleep a saturuje, nikdy se neprevali na "cerstve"
+  {
+    JvRtcState s; jvStavInit(s);
+    CHECK("T21 init: kontrola nikdy nebezela", s.otaMsOdKontroly == JV_OTA_MS_NEZNAMO);
+    jvPripoctiCas(s, 90000);
+    CHECK("T21 pricitani k NEZNAMO zustava NEZNAMO", s.otaMsOdKontroly == JV_OTA_MS_NEZNAMO);
+    jvOtaPoKontrole(s, JV_OTA_AKTUALNI);
+    jvPripoctiCas(s, 90000); jvPripoctiCas(s, 90000);
+    CHECK("T21 po kontrole se pocita realny cas", s.otaMsOdKontroly == 180000UL);
+    s.otaMsOdKontroly = 0xFFFFFFF0UL; jvPripoctiCas(s, 1000);
+    CHECK("T21 saturace misto pretoceni", s.otaMsOdKontroly == 0xFFFFFFFFUL);
+  }
+
+  // T22 RTC stav s OTA poli prezije slot-ochranu a zmena verze ho zneplatni
+  {
+    JvRtcState sloty[2]; memset(sloty, 0, sizeof(sloty));
+    JvRtcState s; jvStavInit(s);
+    jvOtaPrijemZahajeni(s); jvOtaPoKontrole(s, JV_OTA_NAINSTALOVANO); jvSlotyUloz(sloty, s);
+    JvRtcState r;
+    CHECK("T22 OTA pole preziji ulozeni a nacteni", jvSlotyNacti(sloty, r) && r.otaNepotvrzeno == 1);
+    JvRtcState stary = s; stary.verze = 2; jvStavZapecetit(stary);
+    CHECK("T22 stav starsi verze (1.2-lp) se po aktualizaci nepouzije", !jvStavPlatny(stary));
   }
 
   if (g_invalid) { printf("RESULT: INVALID RUN (%d)  pass=%d fail=%d\n", g_invalid, g_pass, g_fail); return 2; }

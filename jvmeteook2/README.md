@@ -1,4 +1,4 @@
-# JVmeteoFW2 – firmware 1.2-lp (low-power + recovery)
+# JVmeteoFW2 – firmware 1.3.0 (low-power + recovery + OTA)
 
 Založeno na `jvmeteook2` (ESP32, ThingSpeak). Low-power a recovery principy
 převzaty ze Zonio legacy `weather_sensory/deepsleep/v5_deepsleep_BME280`
@@ -23,7 +23,7 @@ stisku EN, ne při každém probuzení ze spánku.
 - Konfigurační AP, webový formulář, NVS namespace `meteo` a jeho klíče.
 - Výchozí piny (I²C SDA 6 / SCL 7, DHT 5, MQ-9 2) a výchozí senzor (BME280).
 - Perioda měření 90 s, limit připojení k Wi-Fi 7 s, timeout konfigurace 5 min.
-- Bez OTA, MQTT a XOR.
+- Bez MQTT a XOR. OTA je od 1.3.0 (sekce Aktualizace přes GitHub níž).
 
 ## Co je nové
 
@@ -50,6 +50,39 @@ stisku EN, ne při každém probuzení ze spánku.
   se `errorCount` nikdy nevynuloval. Po 5 chybách senzoru za celou dobu běhu
   pak každá další chyba znamenala `ESP.restart()` místo spánku.
 
+## Aktualizace přes GitHub (OTA, od 1.3.0)
+
+Zařízení si samo stáhne novou verzi z GitHub Releases a před instalací ověří podpis.
+**Zařízení s 1.0 / 1.1 / 1.2-lp OTA nemají: 1.3.0 se nahrává jednou přes USB**
+(`jvmeteo-esp32c3-usb-full-<verze>.bin` z Releases, adresa 0x0).
+
+| Co | Jak |
+| --- | --- |
+| Kdy se kontroluje | Jen po úspěšném odeslání na ThingSpeak (Wi-Fi už běží). Výchozí 24 h, nastavitelné 1–720 h. Po neúspěchu se interval prodlužuje ×2, ×4, ×8. |
+| Nastavení | Portál `JVmeteo_SETUP`, karta *Aktualizace firmware*: zapnout/vypnout automatiku, interval, TalkBack ID + klíč. |
+| Co se stahuje | `releases/latest/download/jvmeteo-esp32c3.version.txt` a `.bin`. „Latest" je nejnovější release, který **není** prerelease; tag `v1.4.0-rc1` zařízení nevidí. |
+| Bezpečnost | `image ‖ podpis RSA-2048 ‖ délka`. Podepsaná zpráva obsahuje čip i verzi: obraz pro jiný čip ani starší podepsaný obraz neprojde. Transport je TLS bez ověření certifikátu, o aktivaci rozhoduje jen podpis (klíč ve firmware: `jv_ota_pubkey.h`). Starší nebo stejná verze se nikdy neinstaluje. |
+| Pojistky | Nekontroluje se po brownoutu ani po pádech, nekontroluje se dokud se předchozí aktualizace nepotvrdila, stahování má strop 150 s. |
+| Rollback | Nový obraz je „na zkoušku", dokud nedokončí 3 měřicí cykly. Spadne-li 3× po sobě dřív, vrátí se předchozí slot a ~8× delší interval chrání před okamžitým novým stažením. |
+| Vzdálená kontrola | ThingSpeak **TalkBack**: příkaz `OTA_CHECK` ve frontě spustí kontrolu při nejbližším odeslání (nejpozději do heartbeatu, ~30 min), i když je automatika vypnutá. Příkaz nevybírá URL ani verzi, jen spustí tutéž kontrolu jako časovač. Minimální rozestup 10 min. |
+
+### Vydání nové verze
+
+1. Zvýšit `FW_VERSION` v `jvmeteook2.ino` (semver, např. `1.3.1`).
+2. `git tag v1.3.1 && git push origin v1.3.1`. Workflow `.github/workflows/firmware.yml`
+   spustí host test, přeloží, **podepíše** a publikuje release. Tag musí odpovídat `FW_VERSION`.
+3. Soukromý klíč je jen v GitHub environmentu `release` jako secret `OTA_SIGNING_KEY`
+   (nikdy v repu). Workflow podpis ověří proti klíči zabudovanému ve firmware; nesedí-li, release nevznikne.
+   Vhodné: v environmentu `release` zapnout schvalování, ať tag sám klíč nepoužije.
+4. Výměna klíče = nový USB flash všech zařízení (stará zařízení jiný klíč nepřijmou).
+
+Lokální test proti vlastnímu serveru: soubor `jv_ota_local.h` vedle sketche (v `.gitignore`)
+a v něm `#define JV_OTA_URL_ZAKLAD "https://<ip>:<port>/"`, `JV_TB_HOST`, `JV_TB_PORT`.
+
+**Neověřeno na hardwaru** (stav k 2026-11-16): celý tok na desce, přesměrování GitHub → CDN
+v `HTTPClient`, odpověď skutečného ThingSpeak TalkBack, rollback na desce. Hotovo a změřeno:
+logika (host test), formát podpisu zařízení ↔ podepisovač, překlad (C3: 92 % flash).
+
 ## Prahy a ladění (BLOCK 01)
 
 `PRAH_TEPLOTA_C 0.5`, `PRAH_VLHKOST_PCT 3`, `PRAH_TLAK_HPA 1`,
@@ -68,8 +101,9 @@ ThingSpeaku je pak schodovitý.
 | 05 | senzory, obnova I²C | 02 |
 | 06 | Wi-Fi a ThingSpeak | 02, 03, 04 |
 | 07 | konfigurační portál a NVS | 02, 04 |
-| 08 | uspání | 04 |
-| 09 | `setup()` / `loop()` | všechny |
+| 08 | **OTA**: GitHub Releases, ověření podpisu, rollback, trigger přes ThingSpeak TalkBack | 02, 03, 04 |
+| 09 | uspání | 04 |
+| 10 | `setup()` / `loop()` | všechny |
 
 Blok 03 nemá žádnou Arduino ani IDF závislost. Proto se dá testovat nativně
 a je připravený pro FW twin.
@@ -80,9 +114,12 @@ a je připravený pro FW twin.
 python test/host/run_host_test.py
 ```
 
-Skript vyřízne BLOCK 03 přímo ze sketche, přeloží ho MSVC a spustí 46 kontrol.
-Pak spustí dvě mutace a ověří, že na každé test spadne: (1) vrácení opravy
-v5 (baseline) a (2) vypnutí ukládání RTC po bootu. Exit 0 = PASS, 1 = FAIL,
+Skript vyřízne BLOCK 03 přímo ze sketche, přeloží ho (MSVC, jinak g++) a spustí
+116 kontrol (T01–T22, z toho OTA T16–T22). Pak spustí osm mutací a ověří, že na
+každé test spadne: vrácení opravy v5, vypnutí ukládání RTC po bootu a šest OTA
+(stejná verze = novější, downgrade, rollback bez příznaku, nikdy nepotvrzeno, bez
+započtení pokusu, bez pojistek). Navíc porovná prefix podpisu, který počítá
+zařízení, bajt po bajtu s `tools/ota/sign_ota.py`. Exit 0 = PASS, 1 = FAIL,
 2 = INVALID RUN (chybí border marks, překlad selhal nebo mutace nenašla svůj
 řádek).
 
