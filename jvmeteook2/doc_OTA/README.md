@@ -1,7 +1,9 @@
 # JVmeteo – OTA přes GitHub Releases: kompletní postup
 
-Stav: ověřeno na desce 2026-11-16 (ESP32-C3, firmware 1.3.0 → 1.3.1 z GitHub Actions: stažení,
-podpis, instalace, restart, potvrzení po 3 cyklech). Co ověřeno **není**, je v posledním oddílu.
+Stav: ověřeno na desce 2026-11-16 (ESP32-C3): OTA 1.3.0 → 1.3.1 → 1.3.2 z GitHub Actions a **reálná aktualizace 1.3.4 → 1.3.5**
+na skutečném ThingSpeaku s ručním triggerem z TalkBacku (stažení, podpis, instalace, restart, potvrzení po 3 cyklech, odesílání na kanál
+pokračuje, konfigurace v NVS přežila). Data jednotky chodí na ThingSpeak kanál (potvrzeno uživatelem grafem polí 1–3). Co ověřeno **není**,
+je v posledním oddílu. Změřené body a nálezy: `research/protokoly/PROTOKOL-jvmeteo-ota-20261116.md` (repo Zonio, ne součást JV).
 
 JVmeteo je samostatný projekt. OTA nezávisí na Zonio ani na jednom konkrétním GitHub účtu:
 každý, kdo repozitář forkne nebo zkopíruje, vydává a podepisuje **své** verze a jeho zařízení
@@ -88,6 +90,18 @@ esptool --chip esp32c3 --port COMx write-flash 0x9000 nvs.bin      # smazat nvs.
   nezávisle na tom, jestli ThingSpeak odpoví) se nejvýš 1× za 24 h (a vždy, když je čas neplatný) synchronizuje `pool.ntp.org` / `time.nist.gov` (strop 4 s, pásmo CET/CEST). Hodiny přežijí
   deep sleep. Čas se vypisuje do logu, OTA ho nepotřebuje (viz TLS výše).
 
+### Ruční trigger krok za krokem (ověřeno na skutečném ThingSpeaku)
+
+1. V ThingSpeaku *Apps → TalkBacks* vytvořit TalkBack. Potřebujete jeho **číslo (ID)** a **TalkBack API klíč** (ID není tajné, klíč ano).
+   V portálu `JVmeteo_SETUP` (nebo v NVS: `tb_id`, `tb_key`) je zadat do jednotky. Bez ID firmware neví, kam volat (`/talkbacks/<ID>/commands/execute`).
+2. Příkaz do fronty (z libovolného počítače, klíč nikdy do logu ani repa):
+   `POST https://api.thingspeak.com/talkbacks/<ID>/commands.json`, tělo `api_key=<TalkBack API klíč>&command_string=OTA_CHECK`
+   (odpověď obsahuje `id`, `command_string`, `position`).
+3. Jednotka frontu čte **jen při odeslání na ThingSpeak** (příkaz se při přečtení odebere). Log: `OTA: prisel trigger (TalkBack)`.
+   Odeslání nastane při změně nad práh (zahřát BME280) nebo při heartbeatu (20 cyklů ≈ 30 min).
+4. Kontrola s `trigger=1` proběhne, až od poslední kontroly uplyne **10 min** (do té doby je žádost uložena v RTC): `OTA: kontrola verze (fw …, trigger=1, …)`.
+5. Příkaz nevybírá URL ani verzi, spustí jen tutéž kontrolu jako časovač. Neplatný příkaz se ignoruje.
+
 ## 6. První nasazení jednotky a ověření na seriálu
 
 1. Nová deska: `…-usb-full-<ver>.bin` na 0x0 (nebo `arduino-cli upload`), potom konfigurace v portálu / zápisem NVS (oddíl 4).
@@ -124,10 +138,13 @@ JVmeteo 1.3.2, boot=deepsleep ...                (bez NEPOTVRZENO = potvrzeno)
 
 ## 8. Neověřeno (stav 2026-11-16)
 
-- rollback na desce; negativní testy na desce (zlý podpis, převrácený bit, jiná verze) – ověřeno jen na hostu a v podepisovači;
-- ruční trigger TalkBack proti skutečnému ThingSpeaku (fake server ho zatím neumí);
-- **NTP:** host test hlídá jen rozhodování (BLOCK 03, T23). Na desce **1.3.2 selhalo**: `NTP: bez odpovedi do 4000 ms` při každém odeslání
-  (zbytečné 4 s radia), přestože se čas nastavil (`Cas: … (RTC)` po restartu byl správný) – příčina: `sntp_get_sync_status()` nikdy nedosáhlo
-  `COMPLETED`. 1.3.3 ověřuje úspěch notifikací jádra (`sntp_set_time_sync_notification_cb`); **na desce zatím neověřeno** (hledat `NTP: synchronizovano za … ms`);
-- pozastavení při OTA: na desce ověřeno jen logem `cinnost pozastavena` před stažením (1.3.2); `cinnost obnovena` se vypíše jen při neúspěšné/aktuální kontrole;
+- rollback na desce; negativní testy na desce (zlý podpis, převrácený bit, jiná verze, useknutý obraz) – ověřeno jen na hostu a v podepisovači.
+  Na desce je dělat proti **vlastnímu lokálnímu HTTPS serveru** (`JV_OTA_URL_ZAKLAD` v `jv_ota_local.h`), nikdy veřejným vadným releasem;
+- automatická aktualizace bez triggeru po uplynutí intervalu (24 h): interval se v testech zkracoval jen v kopii sketche mimo repo;
+- `HTTP -11` při OTA kontrole (jeden vzorek v 1.3.3 hned po NTP, příčina neznámá, dál se neopakovalo);
+- fake ThingSpeak zatím neumí `talkbacks/<ID>/commands/execute` (ruční trigger je ověřen jen proti skutečnému ThingSpeaku);
+- NTP bylo v 1.3.2 chybné (`sntp_get_sync_status()` nikdy nedosáhlo `COMPLETED`, `NTP: bez odpovedi` při každém odeslání); **opraveno v 1.3.3** (notifikace jádra
+  `sntp_set_time_sync_notification_cb`) a **1.3.4** (NTP hned po připojení Wi-Fi). Na desce ověřeno: `NTP: synchronizovano za 1400–3350 ms`;
+- pozastavení při OTA: ověřeno logem `cinnost pozastavena` před stažením a `cinnost obnovena` po kontrole; samotné „nic jiného nebezpečně neběží" je dané
+  jednovláknovým cyklem (blokující `ota_krok()`), jiné vlákno se nepozorovalo;
 - spotřeba OTA kontroly a NTP na baterii; GitHub Enterprise Server se nepodporuje (adresa je pevně `github.com`).
