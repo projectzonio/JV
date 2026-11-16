@@ -84,8 +84,8 @@ esptool --chip esp32c3 --port COMx write-flash 0x9000 nvs.bin      # smazat nvs.
 - **Pozastavení při aktualizaci:** po rozhodnutí o kontrole se až do návratu pozastaví vše ostatní – neměří se, neodesílá, nebeží portál,
   `loop()` nic nespouští a Wi-Fi nesmí uspávat rádio (`WiFi.setSleep(false)`). Stahování má strop 150 s a hlídá ho awake watchdog.
   Konec (i chybový) vždy obnoví činnost (RAII), úspěšná instalace restartuje.
-- **Čas (NTP):** JVmeteo nemá zálohované hodiny, po vypadnutí napájení je čas 1970. Po úspěšném odeslání se nejvýš 1× za 24 h
-  (a vždy, když je čas neplatný) synchronizuje `pool.ntp.org` / `time.nist.gov` (strop 4 s, pásmo CET/CEST). Hodiny přežijí
+- **Čas (NTP):** JVmeteo nemá zálohované hodiny, po vypadnutí napájení je čas 1970. Hned po připojení k Wi-Fi (před odesláním, takže
+  nezávisle na tom, jestli ThingSpeak odpoví) se nejvýš 1× za 24 h (a vždy, když je čas neplatný) synchronizuje `pool.ntp.org` / `time.nist.gov` (strop 4 s, pásmo CET/CEST). Hodiny přežijí
   deep sleep. Čas se vypisuje do logu, OTA ho nepotřebuje (viz TLS výše).
 
 ## 6. První nasazení jednotky a ověření na seriálu
@@ -95,8 +95,10 @@ esptool --chip esp32c3 --port COMx write-flash 0x9000 nvs.bin      # smazat nvs.
    Deska většinu času spí (cyklus 90 s), probuzení vypíše `JVmeteo <verze>, boot=…`.
 3. Očekávané řádky při aktualizaci:
 ```
-Data uspesne zapsana na ThingSpeak ...
+Wi-Fi OK za ... ms
+NTP: synchronizovano za ... ms           (max 1x/24 h)
 Cas: 2026-.. ..:..:.. (NTP)
+Data uspesne zapsana na ThingSpeak ...
 OTA: kontrola verze (fw 1.3.1, trigger=0, streak=N)
 OTA: cinnost pozastavena (mereni, odesilani, portal)
 OTA: server 1.3.2, lokalni 1.3.1

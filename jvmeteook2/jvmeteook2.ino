@@ -74,7 +74,7 @@
 
 // Semver MAJOR.MINOR.PATCH (pripona za '-' se pri porovnani ignoruje). MUSI se
 // shodovat s tagem vydani vMAJOR.MINOR.PATCH - workflow to kontroluje.
-#define FW_VERSION "1.3.3"
+#define FW_VERSION "1.3.4"
 
 // Casove konstanty v milisekundach (puvodni hodnoty zachovany)
 #define INTERVAL_SPANKU_MS 90000       // perioda mereni (90 s, mereno od probuzeni k probuzeni)
@@ -1562,7 +1562,10 @@ void merici_krok() {
       break;
     case F_WIFI: {
       const WifiStav w = wifi_krok();
-      if (w == WS_OK) { faze = F_ODESLI; }
+      if (w == WS_OK) {
+        cas_krok();  // NTP hned po pripojeni (max 1x/24 h), nezavisle na tom, jestli ThingSpeak odpovi
+        faze = F_ODESLI;
+      }
       else if (w == WS_CHYBA) { jvPoSiti(rtcStav, false, cur, 0, ladeni); faze = F_KONEC; }
       break;
     }
@@ -1574,7 +1577,6 @@ void merici_krok() {
       faze = odeslanoOk ? F_OTA : F_KONEC;
       break;
     case F_OTA:
-      cas_krok();  // NTP jen kdyz je potreba (max 1x/24 h); Wi-Fi uz bezi
       ota_krok();  // restartuje, pokud nainstalovala novy firmware
       faze = F_KONEC;
       break;
