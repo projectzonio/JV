@@ -74,7 +74,7 @@
 
 // Semver MAJOR.MINOR.PATCH (pripona za '-' se pri porovnani ignoruje). MUSI se
 // shodovat s tagem vydani vMAJOR.MINOR.PATCH - workflow to kontroluje.
-#define FW_VERSION "1.3.4"
+#define FW_VERSION "1.3.5"
 
 // Casove konstanty v milisekundach (puvodni hodnoty zachovany)
 #define INTERVAL_SPANKU_MS 90000       // perioda mereni (90 s, mereno od probuzeni k probuzeni)
