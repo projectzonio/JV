@@ -74,7 +74,7 @@
 
 // Semver MAJOR.MINOR.PATCH (pripona za '-' se pri porovnani ignoruje). MUSI se
 // shodovat s tagem vydani vMAJOR.MINOR.PATCH - workflow to kontroluje.
-#define FW_VERSION "1.3.1"
+#define FW_VERSION "1.3.2"
 
 // Casove konstanty v milisekundach (puvodni hodnoty zachovany)
 #define INTERVAL_SPANKU_MS 90000       // perioda mereni (90 s, mereno od probuzeni k probuzeni)
@@ -629,6 +629,23 @@ bool jvOtaPrikazJeKontrola(const char *telo) {
   return *telo == '\0';
 }
 
+// --- Cas (NTP) -------------------------------------------------------------
+// JVmeteo nema bateriove zalohovane hodiny: po vypadnuti napajeni je cas 1970.
+// Hodiny prezivaji deep sleep (RTC), takze staci synchronizovat zridka - jen kdyz
+// uz je Wi-Fi pripojena (zadna samostatna relace jen kvuli casu).
+static const int64_t JV_CAS_MIN_PLATNY = 1700000000LL;  // 2023-11-14; mene = hodiny nejsou nastavene
+
+bool jvCasPlatny(int64_t now) { return now >= JV_CAS_MIN_PLATNY; }
+
+// Synchronizovat, kdyz: hodiny nejsou platne, nikdy nebyly synchronizovane,
+// sly zpet (nedulezive), nebo uplynul interval od posledniho uspesneho syncu.
+bool jvCasPotrebaSync(int64_t now, int64_t posledniSync, uint32_t intervalS) {
+  if (!jvCasPlatny(now)) return true;
+  if (posledniSync <= 0) return true;
+  if (now < posledniSync) return true;
+  return (now - posledniSync) >= (int64_t)intervalS;
+}
+
 //-----------3-----------
 
 //-----------4-----------
@@ -898,8 +915,11 @@ void hodnoty_do_pole(float out[JV_POLI]) {
 // BLOCK 06: WI-FI (fast reconnect, adaptive TX) + THINGSPEAK (unchanged fields)
 
 bool komunikace_nastavena() {
-  return THINGSPEAK_CHANNEL_ID != 0UL && wifi_ssid.length() > 0 &&
-         wifi_ssid != "DOPLNTE_WIFI_SSID" && thingspeak_api != "DOPLNTE_THINGSPEAK_WRITE_API";
+  // Cislo kanalu se k zapisu nepouziva (knihovna ThingSpeak posila jen API klic),
+  // takze nesmi byt podminkou: jedna a ta samá release binarka musi fungovat pro kazdou
+  // jednotku a vsechno jednotkove (Wi-Fi, klic) je jen v NVS.
+  return wifi_ssid.length() > 0 && wifi_ssid != "DOPLNTE_WIFI_SSID" &&
+         thingspeak_api.length() > 0 && thingspeak_api != "DOPLNTE_THINGSPEAK_WRITE_API";
 }
 
 static uint32_t hash_ssid() {
@@ -971,7 +991,7 @@ WifiStav wifi_krok() {
 
 // --- Odeslani platnych hodnot oficialni knihovnou ThingSpeak ---
 bool odesli_na_thingspeak() {
-  if (WiFi.status() != WL_CONNECTED || THINGSPEAK_CHANNEL_ID == 0UL) { return false; }
+  if (WiFi.status() != WL_CONNECTED) { return false; }
 
   // Prirazeni jen skutecne nactenych hodnot do jednotlivych poli na cloudu.
   bool ma_data = false;
@@ -1197,9 +1217,60 @@ void spust_konfiguracni_ap() {
 
 #ifdef JV_BEZ_OTA
 // Nativni twin: OTA se nekompiluje, faze F_OTA jen preskoci.
+static volatile bool ota_probiha = false;
+static void cas_nastav_tz() {}
+static void cas_zaloguj(const char *) {}
+static void cas_krok() {}
 static void ota_krok() {}
 static void ota_rollback() {}
 #else  // JV_BEZ_OTA - cely zbytek bloku 08
+
+#include "esp_sntp.h"
+#include <time.h>
+
+// Behem staziteni a zapisu obrazu je vsechna ostatni cinnost POZASTAVENA: nemeri se,
+// neodesila se, nebezi konfiguracni portal a Wi-Fi nesmi uspavat radio (jinak
+// stahovani trva dvakrat dele). Cyklus je jednovlaknovy, takze pozastaveni
+// zajistuje uz to, ze ota_krok() blokuje; priznak navic brani znovuvstupu z loop()
+// a ma jedno misto, ktere se vzdy uvolni (RAII), at ota_krok() skonci jakkoli.
+static volatile bool ota_probiha = false;
+struct OtaPauza {
+  OtaPauza()  { ota_probiha = true;  WiFi.setSleep(false); LOGI("OTA: cinnost pozastavena (mereni, odesilani, portal)"); }
+  ~OtaPauza() { ota_probiha = false; LOGI("OTA: cinnost obnovena"); }
+};
+
+// --- Cas pres NTP: jen kdyz je Wi-Fi uz pripojena, nejvyse 1x za CAS_SYNC_INTERVAL_S ---
+#define CAS_TZ "CET-1CEST,M3.5.0,M10.5.0/3"   // stredni Evropa vcetne letniho casu
+#define CAS_SYNC_INTERVAL_S 86400UL           // 24 h
+#define CAS_SYNC_TIMEOUT_MS 4000UL            // vic radio nezapina; po neuspechu se zkusi pri dalsim odeslani
+RTC_DATA_ATTR static int64_t rtcCasPosledniSync = 0;  // prezije deep sleep, po vypadnuti napajeni je 0 stejne jako hodiny
+
+static void cas_nastav_tz() { setenv("TZ", CAS_TZ, 1); tzset(); }  // po resetu je TZ prazdne
+
+static void cas_zaloguj(const char *zdroj) {
+  const time_t t = time(nullptr);
+  if (!jvCasPlatny((int64_t)t)) { LOGI("Cas: nenastaven (%s)", zdroj); return; }
+  struct tm tmv; localtime_r(&t, &tmv);
+  char b[24]; strftime(b, sizeof(b), "%Y-%m-%d %H:%M:%S", &tmv);
+  LOGI("Cas: %s (%s)", b, zdroj);
+}
+
+static void cas_krok() {
+  if (!jvCasPotrebaSync((int64_t)time(nullptr), rtcCasPosledniSync, CAS_SYNC_INTERVAL_S)) { return; }
+  if (WiFi.status() != WL_CONNECTED) { return; }
+  sntp_set_sync_status(SNTP_SYNC_STATUS_RESET);
+  configTzTime(CAS_TZ, "pool.ntp.org", "time.nist.gov");
+  const uint32_t start = millis();
+  while (sntp_get_sync_status() != SNTP_SYNC_STATUS_COMPLETED && millis() - start < CAS_SYNC_TIMEOUT_MS) {
+    vTaskDelay(pdMS_TO_TICKS(50));
+  }
+  if (sntp_get_sync_status() == SNTP_SYNC_STATUS_COMPLETED) {
+    rtcCasPosledniSync = (int64_t)time(nullptr);
+    cas_zaloguj("NTP");
+  } else {
+    LOGE("NTP: bez odpovedi do %lu ms, zkusi se pri dalsim odeslani", (unsigned long)CAS_SYNC_TIMEOUT_MS);
+  }
+}
 
 #if __has_include("jv_ota_local.h")
 #include "jv_ota_local.h"   // jen pro lokalni testy (v .gitignore): JV_OTA_URL_ZAKLAD, JV_TB_HOST, JV_TB_PORT
@@ -1399,6 +1470,7 @@ static void ota_krok() {
   if (!jvOtaMaKontrolovat(rtcStav, bootTyp, true, ladeni)) { return; }
 
   LOGI("OTA: kontrola verze (fw %s, trigger=%d, streak=%u)", FW_VERSION, rtcStav.otaPozadavek, rtcStav.otaChybStreak);
+  OtaPauza pauza;  // od teď do návratu je ostatní činnost pozastavena
   jvOtaPrijemZahajeni(rtcStav);
   jvSlotyUloz(rtcSloty, rtcStav);  // pokus je zapocitany, i kdyz ho zabije watchdog/brownout
   prodluz_awake_watchdog(OTA_LIMIT_BDENI_MS);
@@ -1496,6 +1568,7 @@ void merici_krok() {
       faze = odeslanoOk ? F_OTA : F_KONEC;
       break;
     case F_OTA:
+      cas_krok();  // NTP jen kdyz je potreba (max 1x/24 h); Wi-Fi uz bezi
       ota_krok();  // restartuje, pokud nainstalovala novy firmware
       faze = F_KONEC;
       break;
@@ -1531,6 +1604,12 @@ void setup() {
        (unsigned long)rtcStav.odeslanoOk, (unsigned long)rtcStav.odeslanoChyba,
        rtcStav.awakeTimeouty, ota_povoleno ? "auto" : "rucne", ota_hodin,
        rtcStav.otaNepotvrzeno ? " NEPOTVRZENO" : "");
+  // Jednotkova konfigurace je jen v NVS (portal / rucni zapis); flash ani OTA ji neprepisuji.
+  LOGI("konfigurace: ssid=%u zn, heslo=%u zn, ts_klic=%u zn, nastavena=%d",
+       (unsigned)wifi_ssid.length(), (unsigned)wifi_pass.length(), (unsigned)thingspeak_api.length(),
+       (int)komunikace_nastavena());
+  cas_nastav_tz();
+  cas_zaloguj("RTC");
   if (jvOtaRollbackNutny(rtcStav, ladeni)) { ota_rollback(); }
 
   // Inicializace ThingSpeak komunikacni vrstvy skrze WiFiClient objekt
@@ -1549,6 +1628,7 @@ void setup() {
 }
 
 void loop() {
+  if (ota_probiha) { vTaskDelay(1); return; }  // aktualizace bezi: nic jineho nespoustet
   if (rezim_konfigurace) {
     server.handleClient();
     if (restartNaplanovan && millis() - restartOd >= 2000UL) { ESP.restart(); }

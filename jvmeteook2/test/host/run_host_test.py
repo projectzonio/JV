@@ -192,6 +192,10 @@ def main():
         # OTA: pokus se nezapocita pred spustenim -> zaseknuty pokus nema backoff.
         ("ota_bez_pesimisticke_stopy", [("s.otaChybStreak = jvSatInc(s.otaChybStreak);", "/* MUTACE */")]),
         # OTA: kontrola i pri brownoutu/padech -> TLS spicka na slabe baterii.
+        # Cas: po intervalu se nikdy znovu nesynchronizuje -> hodiny by driftovaly donekonecna.
+        ("cas_bez_intervalu", [("return (now - posledniSync) >= (int64_t)intervalS;", "return false;  /* MUTACE */")]),
+        # Cas: neplatne hodiny (1970) se nepovazuji za duvod k syncu -> cas by zustal 1970.
+        ("cas_neplatne_hodiny", [("if (!jvCasPlatny(now)) return true;", "/* MUTACE */")]),
         ("ota_bez_pojistek", [("if (boot == JV_BOOT_BROWNOUT || s.brownoutStreak > 0 || s.padStreak > 0) return false;",
                                "/* MUTACE */")]),
     ]

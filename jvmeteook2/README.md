@@ -55,6 +55,10 @@ stisku EN, ne při každém probuzení ze spánku.
 Zařízení si samo stáhne novou verzi z GitHub Releases a před instalací ověří podpis.
 **Zařízení s 1.0 / 1.1 / 1.2-lp OTA nemají: 1.3.0 se nahrává jednou přes USB**
 (`jvmeteo-esp32c3-usb-full-<verze>.bin` z Releases, adresa 0x0).
+**Pozor:** tento obraz má 4 MB a **maže NVS** (Wi-Fi, klíč, nastavení). Už nakonfigurovanou jednotku aktualizujte
+přes `jvmeteo-esp32c3-app-<verze>.bin` na 0x10000 (nebo `arduino-cli upload`); `erase-flash` nepoužívat.
+Konfigurace je jen v NVS (portál / ruční zápis) – kompletní postup včetně NTP, pozastavení při OTA a ověření:
+[`doc_OTA/README.md`](doc_OTA/README.md).
 
 | Co | Jak |
 | --- | --- |
@@ -133,7 +137,7 @@ python test/host/run_host_test.py
 ```
 
 Skript vyřízne BLOCK 03 přímo ze sketche, přeloží ho (MSVC, jinak g++) a spustí
-116 kontrol (T01–T22, z toho OTA T16–T22). Pak spustí osm mutací a ověří, že na
+125 kontrol (T01–T23, z toho OTA T16–T22 a čas/NTP T23). Pak spustí deset mutací a ověří, že na
 každé test spadne: vrácení opravy v5, vypnutí ukládání RTC po bootu a šest OTA
 (stejná verze = novější, downgrade, rollback bez příznaku, nikdy nepotvrzeno, bez
 započtení pokusu, bez pojistek). Navíc porovná prefix podpisu, který počítá

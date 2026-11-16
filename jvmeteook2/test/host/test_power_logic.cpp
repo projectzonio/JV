@@ -464,6 +464,20 @@ int main() {
     CHECK("T22 stav starsi verze (1.2-lp) se po aktualizaci nepouzije", !jvStavPlatny(stary));
   }
 
+  // T23 cas (NTP): kdy se synchronizuje
+  {
+    const int64_t T0 = 1760000000LL;  // platny cas (2025-10)
+    CHECK("T23 hodiny 1970 nejsou platne", !jvCasPlatny(0));
+    CHECK("T23 hranice platnosti", !jvCasPlatny(1699999999LL) && jvCasPlatny(1700000000LL));
+    CHECK("T23 neplatne hodiny -> sync (i kdyz sync vypada cerstve)", jvCasPotrebaSync(100, 50, 86400));
+    CHECK("T23 nikdy nesynchronizovano -> sync", jvCasPotrebaSync(T0, 0, 86400));
+    CHECK("T23 cerstvy sync (1 h) -> bez syncu", !jvCasPotrebaSync(T0 + 3600, T0, 86400));
+    CHECK("T23 presne interval -> sync", jvCasPotrebaSync(T0 + 86400, T0, 86400));
+    CHECK("T23 o sekundu min nez interval -> bez syncu", !jvCasPotrebaSync(T0 + 86399, T0, 86400));
+    CHECK("T23 po intervalu -> sync", jvCasPotrebaSync(T0 + 90000, T0, 86400));
+    CHECK("T23 hodiny sly zpet -> sync", jvCasPotrebaSync(T0 - 10, T0, 86400));
+  }
+
   if (g_invalid) { printf("RESULT: INVALID RUN (%d)  pass=%d fail=%d\n", g_invalid, g_pass, g_fail); return 2; }
   printf("RESULT: %s  pass=%d fail=%d\n", g_fail ? "FAIL" : "PASS", g_pass, g_fail);
   return g_fail ? 1 : 0;

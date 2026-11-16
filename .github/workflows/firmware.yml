@@ -167,6 +167,8 @@ jobs:
 
           printf '%s' "${VER}" > "dist/${OTA_TYPE}.version.txt"
           cp dist/usb-full-unsigned.bin "dist/${OTA_TYPE}-usb-full-${VER}.bin"
+          # Nepodepsana aplikace (na 0x10000): USB aktualizace BEZ ztraty konfigurace v NVS.
+          cp dist/app.bin "dist/${OTA_TYPE}-app-${VER}.bin"
           rm -f dist/app.bin dist/usb-full-unsigned.bin
           ( cd dist && sha256sum * > SHA256SUMS && cat SHA256SUMS )
 
